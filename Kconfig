@@ -1,0 +1,7 @@
+config QUANTUM_OS
+    tristate "Quantum OS kernel framework"
+    default m
+    help
+      Quantum task management framework for QuantumOS.
+      Provides /dev/quantum interface for submitting and
+      managing quantum computing tasks.
