@@ -1,271 +1,457 @@
+#include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/fs.h>
+#include <linux/miscdevice.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
-#include <linux/atomic.h>
+#include <linux/string.h>
 #include <linux/ktime.h>
+#include <linux/atomic.h>
+
 #include "quantum_types.h"
 
-/* 全局 qid 计数器 */
-static atomic_t qid_counter = ATOMIC_INIT(0);
+/* ============================================================
+ * 前向声明（所有跨模块调用，不使用.h）
+ * ============================================================ */
 
-/* 前向声明 */
-int quantum_sched_enqueue(struct quantum_task_struct *task);
+/* quantum_preproc.c */
 int quantum_preproc_run(struct quantum_task_struct *task);
-int quantum_alloc_run(struct quantum_task_struct *task);
-int quantum_batch_run(struct quantum_task_struct *task);
-int qresult_store_status(int qid);
-int qresult_store_get(int qid, struct quantum_result *out);
+
+/* quantum_alloc.c */
+int  quantum_alloc_run(struct quantum_task_struct *task);
 void quantum_alloc_get_pool(struct quantum_backend_pool *out);
+
+/* quantum_batch.c */
+int quantum_batch_run(struct quantum_task_struct *task);
+
+/* quantum_sched.c */
+int quantum_sched_enqueue(struct quantum_task_struct *task);
 int quantum_sched_fetch(struct quantum_fetch_req *out);
 int quantum_sched_commit(struct quantum_commit_req *in);
 int quantum_sched_query_state(int qid);
 int quantum_sched_cancel(int qid);
+int quantum_sched_alloc_qid(void);
+
+/* quantum_result_store.c */
+int qresult_store_status(int qid);
+int qresult_store_get(int qid, struct quantum_result *out);
+void qresult_store_clear(void);
+int qresult_store_put(struct quantum_task_struct *task);
 
 
-/* ===== 工具函数 ===== */
+/* ============================================================
+ * 内部：配置头解析
+ *
+ * 格式："shots=N priority=P mitigation=M alloc_strategy=A split_strategy=S\n"
+ * 字段以空格分隔，缺省字段使用默认值，顺序不固定
+ * ============================================================ */
 
-static const char *parse_submit_header(const char *buf,
-                                        int *shots,
-                                        int *priority,
-                                        int *mitigation)
+static void parse_submit_header(const char *line,
+                                 int *shots,
+                                 int *priority,
+                                 int *mitigation,
+                                 int *alloc_strategy,
+                                 int *split_strategy)
 {
-    const char *next;
+    const char *p = line;
+    char key[32];
+    int  val, ki;
 
     /* 默认值 */
-    *shots      = 1000;
-    *priority   = 0;
-    *mitigation = 0;
+    *shots          = 1000;
+    *priority       = 0;
+    *mitigation     = QMIT_NONE;
+    *alloc_strategy = QALLOC_STRATEGY_FIRST_FIT;
+    *split_strategy = QSPLIT_STRATEGY_NONE;
 
-    /* 没有配置头，直接是QASM */
-    if (strncmp(buf, "OPENQASM", 8) == 0)
-        return buf;
+    while (*p && *p != '\n') {
+        /* 跳过空格 */
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '\n') break;
 
-    /* 有配置头，解析参数 */
-    if (strncmp(buf, "shots=", 6) == 0) {
-        sscanf(buf, "shots=%d priority=%d mitigation=%d",
-               shots, priority, mitigation);
-        /* 跳过配置头这一行 */
-        next = strchr(buf, '\n');
-        if (next)
-            return next + 1;
+        /* 读 key */
+        ki = 0;
+        while (*p && *p != '=' && *p != ' ' && *p != '\n' && ki < 31)
+            key[ki++] = *p++;
+        key[ki] = '\0';
+
+        if (*p != '=')
+            continue;
+        p++; /* 跳过 '=' */
+
+        /* 读 val（正整数） */
+        val = 0;
+        while (*p >= '0' && *p <= '9') {
+            val = val * 10 + (*p - '0');
+            p++;
+        }
+
+        if      (strcmp(key, "shots")          == 0) *shots          = val;
+        else if (strcmp(key, "priority")       == 0) *priority       = val;
+        else if (strcmp(key, "mitigation")     == 0) *mitigation     = val;
+        else if (strcmp(key, "alloc_strategy") == 0) *alloc_strategy = val;
+        else if (strcmp(key, "split_strategy") == 0) *split_strategy = val;
+        /* 未知字段静默忽略，便于后续协议扩展 */
     }
-
-    return buf;
 }
 
-static int is_valid_qasm(const char *buf, size_t len)
+/* ============================================================
+ * 内部：QASM基础合法性检查
+ *
+ * 宽松验证：只检查 OPENQASM 声明是否存在
+ * 详细的语法检查由 preproc 负责
+ * ============================================================ */
+
+static int is_valid_qasm(const char *qasm)
 {
-    if (len < 8)
-        return 0;
-    return (strncmp(buf, "OPENQASM", 8) == 0) ? 1 : 0;
+    return (strstr(qasm, "OPENQASM") != NULL) ? 1 : 0;
 }
 
-/* ===== 字符设备操作 ===== */
+/* ============================================================
+ * 内部：参数范围修正
+ * ============================================================ */
+
+static void sanitize_config(int *shots, int *priority,
+                              int *mitigation, int *alloc_strategy)
+{
+    if (*shots <= 0 || *shots > 100000)
+        *shots = 1000;
+    if (*priority < 0 || *priority > 9)
+        *priority = 0;
+    if (*mitigation < QMIT_NONE || *mitigation > QMIT_PEC)
+        *mitigation = QMIT_NONE;
+    if (*alloc_strategy < QALLOC_STRATEGY_FIRST_FIT ||
+        *alloc_strategy > QALLOC_STRATEGY_TOPO)
+        *alloc_strategy = QALLOC_STRATEGY_FIRST_FIT;
+}
+
+/* ============================================================
+ * 内部：提交链失败处理
+ *
+ * 提交链中任何一步失败，task已分配且error已填写，
+ * 此时将失败结果存入result_store（供用户查询），然后释放task
+ * ============================================================ */
+
+static void submit_chain_fail(struct quantum_task_struct *task)
+{
+    task->state = QTASK_STATE_FAILED;
+    /*
+     * result_store_put 在 sched_commit 中调用（正常路径）
+     * 提交链失败时直接写入 result_store，让用户可以查到失败原因
+     * 复用 qresult_store_get 对应的 put，需要直接构造
+     */
+    qresult_store_put(task);
+    kfree(task);
+}
+
+/* ============================================================
+ * file_operations：open / release
+ * ============================================================ */
+
 static int quantum_open(struct inode *inode, struct file *filp)
 {
-    printk(KERN_INFO "QuantumOS: device opened by pid=%d\n",
-           current->pid);
+    /*
+     * private_data 用于 write() 和 read() 之间传递 qid
+     * 初始化为 -1 表示尚未提交任何任务
+     */
+    filp->private_data = (void *)(long)(-1);
     return 0;
 }
 
 static int quantum_release(struct inode *inode, struct file *filp)
 {
-    printk(KERN_INFO "QuantumOS: device closed by pid=%d\n",
-           current->pid);
     return 0;
 }
 
-static ssize_t quantum_write(struct file *filp, const char __user *buf,
-                              size_t count, loff_t *pos)
-{
-    struct quantum_task_struct *task;
-    const char *qasm_start;
-    int shots, priority, mitigation;
-    int ret;
+/* ============================================================
+ * write()：任务提交
+ *
+ * 完整流程（严格按设计文档 §模块1）：
+ *   parse_submit_header()      解析配置头
+ *   is_valid_qasm()            QASM基础验证
+ *   kzalloc(task)              分配 task（~38KB，堆分配，不在栈上）
+ *   初始化 interface 负责的字段  qid/task_type/priority/shots/...
+ *   → quantum_preproc_run()    线路分析、切分、误差缓解预处理
+ *   → quantum_alloc_run()      qubit分配、保真度预估
+ *   → quantum_batch_run()      子线路验证、批处理标记
+ *   → quantum_sched_enqueue()  入调度队列
+ *   filp->private_data = qid   供 read() 返回给用户
+ * ============================================================ */
 
+static ssize_t quantum_write(struct file *filp,
+                              const char __user *ubuf,
+                              size_t count,
+                              loff_t *ppos)
+{
+    char *kbuf;
+    char *qasm_start;
+    struct quantum_task_struct *task;
+    int shots, priority, mitigation, alloc_strategy, split_strategy;
+    int qid, ret;
+
+    /* 基本长度检查 */
     if (count == 0 || count >= QUANTUM_QIR_SIZE) {
-        printk(KERN_WARNING "QuantumOS: invalid write size=%zu\n", count);
+        pr_warn("quantum_interface: write size %zu invalid "
+                "(must be 1~%d)\n", count, QUANTUM_QIR_SIZE - 1);
         return -EINVAL;
     }
 
-    task = kzalloc(sizeof(*task), GFP_KERNEL);
-    if (!task)
+    /* 1. 拷贝用户数据到内核缓冲区 */
+    kbuf = kzalloc(QUANTUM_QIR_SIZE, GFP_KERNEL);
+    if (!kbuf)
         return -ENOMEM;
 
-    if (copy_from_user(task->qir, buf, count)) {
-        kfree(task);
+    if (copy_from_user(kbuf, ubuf, count)) {
+        kfree(kbuf);
         return -EFAULT;
     }
-    task->qir[count] = '\0';
+    kbuf[count] = '\0';
 
-    /* 解析可选配置头，获取QASM起始位置 */
-    qasm_start = parse_submit_header(task->qir,
-                                     &shots, &priority, &mitigation);
+    /* 2. 解析配置头（第一行） */
+    parse_submit_header(kbuf, &shots, &priority, &mitigation,
+                        &alloc_strategy, &split_strategy);
+    sanitize_config(&shots, &priority, &mitigation, &alloc_strategy);
 
-    /* 验证QASM语法 */
-    if (!is_valid_qasm(qasm_start, strlen(qasm_start))) {
-        printk(KERN_WARNING "QuantumOS: invalid QASM syntax\n");
-        kfree(task);
+    /* 3. 定位 QASM 正文（第一个 '\n' 之后）
+     *    若没有换行符，整体视为 QASM（用户未写配置头，使用默认配置）
+     */
+    qasm_start = strchr(kbuf, '\n');
+    if (qasm_start)
+        qasm_start++; /* 跳过 '\n' */
+    else
+        qasm_start = kbuf;
+
+    /* 4. QASM 基础验证 */
+    if (!is_valid_qasm(qasm_start)) {
+        pr_warn("quantum_interface: invalid QASM "
+                "(missing OPENQASM declaration)\n");
+        kfree(kbuf);
         return -EINVAL;
     }
 
-    /* 初始化任务元数据 */
-    task->qid              = atomic_inc_return(&qid_counter);
-    task->task_type        = QTASK_TYPE_NORMAL;
-    task->priority         = priority;
-    task->shots            = shots;
-    task->error_mitigation = mitigation;
-    task->state            = QTASK_STATE_RECEIVED;
-    task->submit_time      = ktime_get_ns();
-    task->error_code       = QERR_OK;
-
-    printk(KERN_INFO "QuantumOS: task received qid=%d pid=%d shots=%d\n",
-           task->qid, current->pid, task->shots);
-
-    /* 依次送入各模块处理 */
-    ret = quantum_preproc_run(task);
-    if (ret) {
-        /* preproc 返回错误：QASM 本身有问题（非超限）
-         * 超限时 preproc 设置 need_split=1 并返回0，不走这里 */
-        task->state      = QTASK_STATE_FAILED;
-        task->error_code = QERR_COMPILE_FAIL;
-        printk(KERN_ERR "QuantumOS: preproc failed qid=%d ret=%d\n",
-               task->qid, ret);
-        kfree(task);
-        return ret;
+    /* 5. 分配 task（约 38KB，必须堆分配）*/
+    task = kzalloc(sizeof(*task), GFP_KERNEL);
+    if (!task) {
+        kfree(kbuf);
+        return -ENOMEM;
     }
 
-    /* 切分失败：need_split=1 但 num_sub_circuits=0 */
-    if (task->need_split && task->num_sub_circuits == 0) {
-        printk(KERN_ERR "QuantumOS: split failed qid=%d\n", task->qid);
-        kfree(task);
+    /* 6. 初始化 interface 负责的字段
+     *    严格遵守设计文档字段职责分工
+     */
+    qid = quantum_sched_alloc_qid();
+
+    task->qid             = qid;
+    task->task_type       = QTASK_TYPE_NORMAL;
+    task->priority        = priority;
+    task->shots           = shots;
+    task->error_mitigation = mitigation;
+    task->alloc_strategy  = alloc_strategy;
+    task->submit_time     = ktime_get_ns();
+    task->state           = QTASK_STATE_RECEIVED;
+
+    /*
+     * split_strategy 用户提示值存入 task：
+     *   0=NONE → preproc 自行决定是否需要切分及使用哪种策略
+     *   >0     → preproc 将使用用户指定的策略（如有必要）
+     */
+    task->split_strategy      = split_strategy;
+    task->assigned_backend_id = -1;
+    task->batch_group_id      = -1;
+    task->error_code          = QERR_OK;
+
+    INIT_LIST_HEAD(&task->list);
+
+    /*
+     * 将完整提交内容（含配置头）存入 task->qir
+     * preproc 解析 QASM 时会跳过配置头行（找第一个 '\n' 后的内容）
+     * sched FETCH 时同样剥离配置头再发送给 daemon
+     */
+    strncpy(task->qir, kbuf, QUANTUM_QIR_SIZE - 1);
+    task->qir[QUANTUM_QIR_SIZE - 1] = '\0';
+
+    kfree(kbuf);
+
+    pr_info("quantum_interface: received qid=%d shots=%d priority=%d "
+            "mitigation=%d alloc=%d split_hint=%d\n",
+            qid, shots, priority, mitigation,
+            alloc_strategy, split_strategy);
+
+    /* 7. 提交链：同步，write() 上下文
+     *
+     * 任何一步失败：填写 error_code → submit_chain_fail → 返回错误
+     * 用户可通过 STATUS ioctl 查询到 FAILED 状态和 error_info
+     */
+
+    ret = quantum_preproc_run(task);
+    if (ret != 0) {
+        pr_err("quantum_interface: preproc failed qid=%d err=%d\n", qid, ret);
+        submit_chain_fail(task);
         return -EINVAL;
     }
 
     ret = quantum_alloc_run(task);
-    if (ret) {
-        task->state      = QTASK_STATE_FAILED;
-        task->error_code = QERR_NO_RESOURCE;
-        printk(KERN_ERR "QuantumOS: alloc failed qid=%d\n", task->qid);
-        kfree(task);
-        return ret;
+    if (ret != 0) {
+        pr_err("quantum_interface: alloc failed qid=%d err=%d\n", qid, ret);
+        submit_chain_fail(task);
+        return -EBUSY;
     }
 
     ret = quantum_batch_run(task);
-    if (ret) {
-        task->state      = QTASK_STATE_FAILED;
-        task->error_code = QERR_COMPILE_FAIL;
-        printk(KERN_ERR "QuantumOS: batch failed qid=%d\n", task->qid);
-        kfree(task);
-        return ret;
+    if (ret != 0) {
+        pr_err("quantum_interface: batch failed qid=%d err=%d\n", qid, ret);
+        submit_chain_fail(task);
+        return -EINVAL;
     }
 
-    /* 入调度队列 */
     ret = quantum_sched_enqueue(task);
-    if (ret) {
-        task->state      = QTASK_STATE_FAILED;
-        task->error_code = QERR_QUEUE_FULL;
-        printk(KERN_ERR "QuantumOS: enqueue failed qid=%d\n", task->qid);
-        kfree(task);
-        return ret;
+    if (ret != 0) {
+        pr_err("quantum_interface: enqueue failed qid=%d err=%d\n", qid, ret);
+        submit_chain_fail(task);
+        return -EBUSY;
     }
 
-    /* 把 qid 存入 file 私有数据，供 read() 取回 */
-    filp->private_data = (void *)(long)task->qid; 
+    /* 8. 保存 qid，供后续 read() 返回给用户 */
+    filp->private_data = (void *)(long)qid;
 
-    printk(KERN_INFO "QuantumOS: task queued qid=%d\n", task->qid);
+    pr_info("quantum_interface: qid=%d enqueued successfully\n", qid);
     return (ssize_t)count;
 }
 
-static ssize_t quantum_read(struct file *filp, char __user *buf,
-                             size_t count, loff_t *pos)
+/* ============================================================
+ * read()：返回 qid
+ *
+ * 用户在 write() 成功后立即调用 read() 获取分配的 qid
+ * 协议：read(fd, &qid, sizeof(int)) → qid > 0
+ * ============================================================ */
+
+static ssize_t quantum_read(struct file *filp,
+                             char __user *ubuf,
+                             size_t count,
+                             loff_t *ppos)
 {
     int qid = (int)(long)filp->private_data;
 
+    if (qid <= 0) {
+        pr_warn("quantum_interface: read() called before write() "
+                "or write() failed\n");
+        return -EINVAL;
+    }
+
     if (count < sizeof(int))
         return -EINVAL;
-    if (qid <= 0)
-        return -ENODATA;
-    if (copy_to_user(buf, &qid, sizeof(int)))
+
+    if (copy_to_user(ubuf, &qid, sizeof(int)))
         return -EFAULT;
+
+    /* 重置，防止重复读到同一个 qid */
+    filp->private_data = (void *)(long)(-1);
 
     return sizeof(int);
 }
 
-static long quantum_ioctl(struct file *filp, unsigned int cmd,
+/* ============================================================
+ * ioctl()：状态查询 / 结果取回 / 取消 / 资源查询 / daemon交互
+ *
+ * 设计原则：interface 不含业务逻辑，只做路由
+ * ============================================================ */
+
+static long quantum_ioctl(struct file *filp,
+                           unsigned int cmd,
                            unsigned long arg)
 {
-    int qid;
-    int state;
+    void __user *uarg = (void __user *)arg;
     int ret = 0;
-    struct quantum_result       *result = NULL;
-    struct quantum_backend_pool *pool   = NULL;
 
     switch (cmd) {
 
-    case QIOC_STATUS:
-        if (get_user(qid, (int __user *)arg))
+    case QIOC_STATUS: {
+        struct quantum_status_req req;
+        int state;
+
+        if (copy_from_user(&req, uarg, sizeof(req)))
             return -EFAULT;
 
-        /* 先查调度队列（任务还在执行中）*/
-        state = quantum_sched_query_state(qid);
+        state = quantum_sched_query_state(req.qid);
 
-        /* 队列里没有，再查结果表（任务已完成）*/
         if (state == QTASK_STATE_UNKNOWN)
-            state = qresult_store_status(qid);
+            state = qresult_store_status(req.qid);
 
-        /*
-         * MERGING 是内核内部状态，对用户态表现为 RUNNING
-         * 避免 libquantum 因看到未知状态而提前 timeout
-         */
         if (state == QTASK_STATE_MERGING)
             state = QTASK_STATE_RUNNING;
 
-        printk(KERN_INFO "QuantumOS: ioctl STATUS qid=%d state=%d\n",
-               qid, state);
-        return state;
+        if (state < 0)
+            state = QTASK_STATE_UNKNOWN;
 
-    case QIOC_RESULT:
-        result = kzalloc(sizeof(*result), GFP_KERNEL);
-        if (!result)
-            return -ENOMEM;
-        if (copy_from_user(result, (void __user *)arg, sizeof(*result))) {
-            ret = -EFAULT;
-            goto out_result;
-        }
-        qid = result->qid;
-        if (qresult_store_get(qid, result) < 0) {
-            ret = -ENOENT;
-            goto out_result;
-        }
-        if (copy_to_user((void __user *)arg, result, sizeof(*result))) {
-            ret = -EFAULT;
-            goto out_result;
-        }
-        printk(KERN_INFO "QuantumOS: ioctl RESULT qid=%d delivered\n", qid);
-out_result:
-        kfree(result);
-        return ret;
-
-    case QIOC_CANCEL:
-        if (get_user(qid, (int __user *)arg))
+        req.state = state;
+        if (copy_to_user(uarg, &req, sizeof(req)))
             return -EFAULT;
-        ret = quantum_sched_cancel(qid);
-        printk(KERN_INFO "QuantumOS: ioctl CANCEL qid=%d ret=%d\n", qid, ret);
-        return ret;
 
-    case QIOC_RESOURCE:
+        break;
+    }
+
+    /* ── QIOC_RESULT：取回执行结果（堆分配避免栈帧过大）── */
+    case QIOC_RESULT: {
+        struct quantum_result_req *req;
+
+        req = kzalloc(sizeof(*req), GFP_KERNEL);
+        if (!req)
+            return -ENOMEM;
+
+        if (copy_from_user(req, uarg, sizeof(*req))) {
+            kfree(req);
+            return -EFAULT;
+        }
+
+        ret = qresult_store_get(req->qid, &req->result);
+        if (ret == -ENOENT) {
+            kfree(req);
+            return -EAGAIN;
+        }
+        if (ret != 0) {
+            kfree(req);
+            return ret;
+        }
+
+        if (copy_to_user(uarg, req, sizeof(*req))) {
+            kfree(req);
+            return -EFAULT;
+        }
+
+        kfree(req);
+        break;
+    }
+
+    case QIOC_CANCEL: {
+        struct quantum_cancel_req req;
+
+        if (copy_from_user(&req, uarg, sizeof(req)))
+            return -EFAULT;
+
+        ret = quantum_sched_cancel(req.qid);
+        break;
+    }
+
+    /* ── QIOC_RESOURCE：查询后端资源池（堆分配）── */
+    case QIOC_RESOURCE: {
+        struct quantum_backend_pool *pool;
+
         pool = kzalloc(sizeof(*pool), GFP_KERNEL);
         if (!pool)
             return -ENOMEM;
-        quantum_alloc_get_pool(pool);
-        if (copy_to_user((void __user *)arg, pool, sizeof(*pool)))
-            ret = -EFAULT;
-        else
-            printk(KERN_INFO "QuantumOS: ioctl RESOURCE delivered\n");
-        kfree(pool);
-        return ret;
 
+        quantum_alloc_get_pool(pool);
+
+        if (copy_to_user(uarg, pool, sizeof(*pool))) {
+            kfree(pool);
+            return -EFAULT;
+        }
+
+        kfree(pool);
+        break;
+    }
+
+    /* ── QIOC_FETCH：daemon取待执行任务（堆分配）── */
     case QIOC_FETCH: {
         struct quantum_fetch_req *freq;
 
@@ -274,19 +460,21 @@ out_result:
             return -ENOMEM;
 
         ret = quantum_sched_fetch(freq);
-        if (ret < 0) {
+        if (ret != 0) {
             kfree(freq);
-            return ret;
+            return ret;  /* -EAGAIN或其他错误直接透传 */
         }
 
-        if (copy_to_user((void __user *)arg, freq, sizeof(*freq))) {
+        if (copy_to_user(uarg, freq, sizeof(*freq))) {
             kfree(freq);
             return -EFAULT;
         }
+
         kfree(freq);
-        return 0;
+        break;
     }
 
+    /* ── QIOC_COMMIT：daemon提交执行结果（堆分配）── */
     case QIOC_COMMIT: {
         struct quantum_commit_req *creq;
 
@@ -294,23 +482,28 @@ out_result:
         if (!creq)
             return -ENOMEM;
 
-        if (copy_from_user(creq, (void __user *)arg, sizeof(*creq))) {
+        if (copy_from_user(creq, uarg, sizeof(*creq))) {
             kfree(creq);
             return -EFAULT;
         }
 
         ret = quantum_sched_commit(creq);
         kfree(creq);
-        return ret;
+        break;
     }
 
     default:
         return -ENOTTY;
     }
+
+    return ret;
 }
 
-/* ===== fops 导出给 quantum_main.c ===== */
-const struct file_operations quantum_fops = {
+/* ============================================================
+ * file_operations 注册表
+ * ============================================================ */
+
+static const struct file_operations quantum_fops = {
     .owner          = THIS_MODULE,
     .open           = quantum_open,
     .release        = quantum_release,
@@ -319,13 +512,37 @@ const struct file_operations quantum_fops = {
     .unlocked_ioctl = quantum_ioctl,
 };
 
+/* ============================================================
+ * miscdevice 注册
+ * ============================================================ */
+
+static struct miscdevice quantum_miscdev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = QUANTUM_DEV_NAME,
+    .fops  = &quantum_fops,
+};
+
+/* ============================================================
+ * 对外接口：由 quantum_main.c 调用
+ * ============================================================ */
+
 int quantum_interface_init(void)
 {
-    printk(KERN_INFO "QuantumOS: interface module init\n");
+    int ret;
+
+    ret = misc_register(&quantum_miscdev);
+    if (ret) {
+        pr_err("quantum_interface: misc_register failed: %d\n", ret);
+        return ret;
+    }
+
+    pr_info("quantum_interface: /dev/%s registered\n", QUANTUM_DEV_NAME);
     return 0;
 }
 
 void quantum_interface_exit(void)
 {
-    printk(KERN_INFO "QuantumOS: interface module exit\n");
+    misc_deregister(&quantum_miscdev);
+    qresult_store_clear();
+    pr_info("quantum_interface: /dev/%s unregistered\n", QUANTUM_DEV_NAME);
 }

@@ -1,2 +1,2 @@
-drivers/misc/quantum_os/quantum_main.o drivers/misc/quantum_os/quantum_interface.o drivers/misc/quantum_os/quantum_preproc.o drivers/misc/quantum_os/quantum_alloc.o drivers/misc/quantum_os/quantum_batch.o drivers/misc/quantum_os/quantum_sched.o drivers/misc/quantum_os/quantum_postproc.o drivers/misc/quantum_os/quantum_calib.o drivers/misc/quantum_os/quantum_result_store.o
+drivers/misc/quantum_os/quantum_main.o drivers/misc/quantum_os/quantum_alloc.o drivers/misc/quantum_os/quantum_preproc.o drivers/misc/quantum_os/quantum_batch.o drivers/misc/quantum_os/quantum_sched.o drivers/misc/quantum_os/quantum_postproc.o drivers/misc/quantum_os/quantum_result_store.o drivers/misc/quantum_os/quantum_calib.o drivers/misc/quantum_os/quantum_interface.o
 

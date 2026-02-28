@@ -1,164 +1,509 @@
 #include <linux/kernel.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/ktime.h>
+
 #include "quantum_types.h"
 
+/* ============================================================
+ * 全局状态
+ * ============================================================ */
+
 /*
- * 全局后端池
- * 对应经典OS的 cpu_data[] 表
+ * g_backend_pool：QPU资源池，记录各后端占用状态
+ * g_dev_info：    硬件描述符，记录各qubit校准与拓扑数据
+ *
+ * 并发规则：
+ *   g_backend_pool 由 g_alloc_lock 保护
+ *   g_dev_info     由 g_devinfo_lock 保护
+ *   读取时加锁拍快照，快照后释放锁再使用数据
  */
 static struct quantum_backend_pool g_backend_pool;
-static DEFINE_SPINLOCK(backend_lock);
+static struct quantum_dev_info     g_dev_info;
+static DEFINE_SPINLOCK(g_alloc_lock);
+static DEFINE_SPINLOCK(g_devinfo_lock);
 
-/* ===== 初始化：注册所有QPU ===== */
-int quantum_alloc_init(void)
+/* ============================================================
+ * 内部：分配算法实现
+ * ============================================================ */
+
+/*
+ * alloc_first_fit —— 第一个满足qubit数需求的空闲QPU
+ *
+ * 参数说明（统一签名，未使用的参数标注忽略）：
+ *   need_qubits  需要的qubit数
+ *   devinfo      硬件快照（本算法不使用，签名统一预留）
+ *   task         任务元数据（本算法不使用，签名统一预留）
+ *   out_backend  输出：选中的QPU编号
+ *   out_start    输出：物理qubit起始编号（本算法使用：线性分配）
+ *   out_phys     输出：逻辑→物理qubit完整映射（本算法简单填充）
+ */
+static int alloc_first_fit(int need_qubits,
+                            const struct quantum_dev_info *devinfo,
+                            const struct quantum_task_struct *task,
+                            int *out_backend,
+                            int *out_start,
+                            int *out_phys)
 {
-    int i;
-    g_backend_pool.num_backends = 2;
+    unsigned long flags;
+    int i, j;
 
+    spin_lock_irqsave(&g_alloc_lock, flags);
     for (i = 0; i < g_backend_pool.num_backends; i++) {
         struct quantum_backend *b = &g_backend_pool.backends[i];
-        b->id           = i;
-        b->total_qubits = QUANTUM_MAX_QUBITS;   /* 64，与 preproc 切分阈值一致 */
-        b->state        = QBACKEND_STATE_IDLE;
-        b->current_qid  = -1;
-        b->last_calibration_time = 0;
-        snprintf(b->name, sizeof(b->name), "qpu-%d", i);
-        printk(KERN_INFO "QuantumOS: registered backend %s "
-               "qubits=%d\n", b->name, b->total_qubits);
+        if (b->state == QBACKEND_STATE_IDLE &&
+            b->total_qubits >= need_qubits) {
+            *out_backend = i;
+            *out_start   = 0;
+            /* 线性映射：逻辑qubit j → 物理qubit j */
+            for (j = 0; j < need_qubits && j < QUANTUM_MAX_QUBITS; j++)
+                out_phys[j] = j;
+            spin_unlock_irqrestore(&g_alloc_lock, flags);
+            return 0;
+        }
+    }
+    spin_unlock_irqrestore(&g_alloc_lock, flags);
+    return -1;
+}
+
+/*
+ * alloc_fidelity_opt —— 里程碑6占位
+ * 选择保真度预估最高的空闲QPU，需要devinfo中的gate_fidelity数据
+ */
+static int alloc_fidelity_opt(int need_qubits,
+                               const struct quantum_dev_info *devinfo,
+                               const struct quantum_task_struct *task,
+                               int *out_backend,
+                               int *out_start,
+                               int *out_phys)
+{
+    /*
+     * 里程碑6实现提示：
+     * 1. 遍历所有IDLE且qubit数满足需求的后端
+     * 2. 对每个后端，计算 qubit[0..need_qubits-1] 的
+     *    gate2_fidelity 均值（x1000整数）
+     * 3. 乘以退相干衰减因子：exp(-depth/T2)用整数近似
+     * 4. 选择综合得分最高的后端
+     */
+    pr_warn_once("alloc_fidelity_opt: not implemented, falling back to first_fit\n");
+    return alloc_first_fit(need_qubits, devinfo, task,
+                           out_backend, out_start, out_phys);
+}
+
+/*
+ * alloc_topo_match —— 里程碑6占位
+ * 基于qubit_mapping[]做子图同构匹配，最小化SWAP门数
+ */
+static int alloc_topo_match(int need_qubits,
+                             const struct quantum_dev_info *devinfo,
+                             const struct quantum_task_struct *task,
+                             int *out_backend,
+                             int *out_start,
+                             int *out_phys)
+{
+    /*
+     * 里程碑6实现提示：
+     * 1. 从 task->sub_circuits[task->num_sub_done].qubit_mapping[]
+     *    提取逻辑qubit间的连接关系（门操作图）
+     * 2. 在 devinfo->qubits[].neighbors[] 描述的物理拓扑图中
+     *    做子图同构搜索（VF2算法）
+     * 3. 找到最优映射，填写 out_phys[]
+     */
+    pr_warn_once("alloc_topo_match: not implemented, falling back to first_fit\n");
+    return alloc_first_fit(need_qubits, devinfo, task,
+                           out_backend, out_start, out_phys);
+}
+
+/* 分配算法函数指针类型 */
+typedef int (*quantum_alloc_fn)(int need_qubits,
+                                 const struct quantum_dev_info *devinfo,
+                                 const struct quantum_task_struct *task,
+                                 int *out_backend,
+                                 int *out_start,
+                                 int *out_phys);
+
+/* 策略表（新增算法：实现函数后在此注册，不修改其他文件） */
+static const quantum_alloc_fn alloc_strategy_table[] = {
+    [QALLOC_STRATEGY_FIRST_FIT]  = alloc_first_fit,
+    [QALLOC_STRATEGY_FIDELITY]   = alloc_fidelity_opt,
+    [QALLOC_STRATEGY_REGRESSION] = alloc_first_fit,   /* 里程碑6替换 */
+    [QALLOC_STRATEGY_TOPO]       = alloc_topo_match,
+};
+
+#define ALLOC_STRATEGY_MAX \
+    (sizeof(alloc_strategy_table) / sizeof(alloc_strategy_table[0]))
+
+/*
+ * 执行分配策略（内部调用，已加锁或无需加锁的上下文）
+ * strategy超出范围时回退到FIRST_FIT
+ */
+static int alloc_do_strategy(int strategy,
+                              int need_qubits,
+                              const struct quantum_dev_info *devinfo,
+                              const struct quantum_task_struct *task,
+                              int *out_backend,
+                              int *out_start,
+                              int *out_phys)
+{
+    quantum_alloc_fn fn;
+
+    if (strategy < 0 || strategy >= (int)ALLOC_STRATEGY_MAX ||
+        !alloc_strategy_table[strategy]) {
+        strategy = QALLOC_STRATEGY_FIRST_FIT;
+    }
+    fn = alloc_strategy_table[strategy];
+    return fn(need_qubits, devinfo, task, out_backend, out_start, out_phys);
+}
+
+/* ============================================================
+ * 内部：保真度预估（整数近似）
+ * ============================================================ */
+
+/*
+ * 基于qubit校准数据估算线路保真度
+ * 返回值：0~1000
+ *
+ * 当前实现：简单均值模型
+ *   fidelity = avg(gate1_fidelity) * (1 - gate_count * avg_error_rate)
+ * 里程碑6：替换为数值代价模型（乘积公式 + 退相干衰减）
+ */
+static int estimate_fidelity(int backend_id,
+                              int num_qubits,
+                              int gate_count,
+                              const struct quantum_dev_info *devinfo)
+{
+    int base, i, offset, sum, count;
+
+    if (backend_id < 0 || backend_id >= devinfo->num_backends)
+        return 500; /* 默认中等保真度 */
+
+    base  = backend_id * QUANTUM_MAX_QUBITS;
+    sum   = 0;
+    count = 0;
+
+    for (i = 0; i < num_qubits && i < QUANTUM_MAX_QUBITS; i++) {
+        offset = base + i;
+        if (offset < QUANTUM_MAX_TOTAL_QUBITS &&
+            devinfo->qubits[offset].available) {
+            sum   += devinfo->qubits[offset].gate1_fidelity_x1000;
+            count++;
+        }
     }
 
-    printk(KERN_INFO "QuantumOS: alloc module init, "
-           "backends=%d\n", g_backend_pool.num_backends);
+    if (count == 0)
+        return 500;
+
+    /* avg_fidelity = sum / count（已是×1000） */
+    /* 门数越多，保真度衰减：每个门约损失 (1000 - avg)/1000 × 1 ‰ */
+    return sum / count;
+}
+
+/* ============================================================
+ * 对外接口：初始化/退出
+ * ============================================================ */
+
+int quantum_alloc_init(void)
+{
+    int i, j;
+
+    memset(&g_backend_pool, 0, sizeof(g_backend_pool));
+    memset(&g_dev_info,     0, sizeof(g_dev_info));
+
+    /* 初始化一个模拟后端（sim0） */
+    g_backend_pool.num_backends = 1;
+
+    g_backend_pool.backends[0].id           = 0;
+    strncpy(g_backend_pool.backends[0].name, "sim0",
+            sizeof(g_backend_pool.backends[0].name) - 1);
+    g_backend_pool.backends[0].total_qubits     = QUANTUM_MAX_QUBITS;
+    g_backend_pool.backends[0].state            = QBACKEND_STATE_IDLE;
+    g_backend_pool.backends[0].current_qid      = -1;
+    g_backend_pool.backends[0].fidelity_score   = 1000; /* 模拟器理想保真度 */
+    g_backend_pool.backends[0].num_qubits_available = QUANTUM_MAX_QUBITS;
+    g_backend_pool.backends[0].connectivity_type = 0;   /* 全连接 */
+
+    /* 初始化DevInfo（sim0的所有qubit设为理想可用状态） */
+    g_dev_info.num_backends = 1;
+    g_dev_info.total_qubits = QUANTUM_MAX_QUBITS;
+
+    for (i = 0; i < QUANTUM_MAX_QUBITS; i++) {
+        struct quantum_qubit_info *q = &g_dev_info.qubits[i];
+        q->qubit_id  = i;
+        q->backend_id = 0;
+        q->local_id  = i;
+        q->available = 1;
+
+        /* 模拟器：理想参数 */
+        q->t1_us_x10               = 1000; /* 100 μs */
+        q->t2_us_x10               = 1000;
+        q->readout_fidelity_x1000  = 1000;
+        q->gate1_fidelity_x1000    = 1000;
+        q->gate2_fidelity_x1000    = 1000;
+
+        /* 拓扑：全连接（邻居为所有其他qubit，仅填前QUANTUM_MAX_NEIGHBORS个） */
+        q->num_neighbors = 0;
+        for (j = 0; j < QUANTUM_MAX_NEIGHBORS; j++)
+            q->neighbors[j] = -1;
+
+        q->coupling_map    = 0;
+        q->last_update_time = 0;
+    }
+
+    pr_info("quantum_alloc: initialized, %d backend(s), %d qubits\n",
+            g_backend_pool.num_backends, g_dev_info.total_qubits);
     return 0;
 }
 
 void quantum_alloc_exit(void)
 {
-    printk(KERN_INFO "QuantumOS: alloc module exit\n");
+    pr_info("quantum_alloc: exiting\n");
 }
 
+/* ============================================================
+ * 对外接口：提交链调用
+ * ============================================================ */
+
 /*
- * 为任务选择一个空闲QPU
- * 策略：选第一个满足qubit需求的空闲QPU
- * 后续可扩展为保真度优先等策略
+ * quantum_alloc_run —— 提交链中调用
+ *
+ * need_split=0：执行分配，填写 task->assigned_backend_id/phys_qubits[]/fidelity_score
+ * need_split=1：跳过，子线路在sched dispatch时由quantum_alloc_find_idle单独分配
  */
 int quantum_alloc_run(struct quantum_task_struct *task)
 {
-    int i, need_qubits;
-    struct quantum_backend *b;
+    /* 修复：devinfo_snap 从栈改为堆分配 */
+    struct quantum_dev_info *devinfo_snap;
+    int phys[QUANTUM_MAX_QUBITS];
+    int out_backend = -1, out_start = 0;
+    int ret;
 
-    task->assigned_backend_id = -1;
-
-    /*
-     * 切分任务：alloc_run 阶段不做 QPU 绑定
-     * 原因：各子线路会在 sched dispatch 时按子线路的 num_qubits 独立分配
-     * 此处只做合法性预检（确保至少有一个后端能跑最大的子线路）
-     */
     if (task->need_split) {
-        printk(KERN_INFO "QuantumOS: [alloc] qid=%d need_split=1 "
-               "skip pre-alloc, sub-circuits will be allocated "
-               "individually\n", task->qid);
+        pr_debug("quantum_alloc: qid=%d need_split=1, skipping global alloc\n",
+                 task->qid);
+        task->assigned_backend_id = -1;
+        task->fidelity_score      = 0;
         return 0;
     }
 
-    need_qubits = task->num_qubits;
+    devinfo_snap = kzalloc(sizeof(*devinfo_snap), GFP_KERNEL);
+    if (!devinfo_snap)
+        return -ENOMEM;
 
-    spin_lock(&backend_lock);
-    for (i = 0; i < g_backend_pool.num_backends; i++) {
-        b = &g_backend_pool.backends[i];
-        if (b->state == QBACKEND_STATE_IDLE &&
-            b->total_qubits >= need_qubits) {
-            task->assigned_backend_id = b->id;
-            printk(KERN_INFO "QuantumOS: [alloc] qid=%d → %s "
-                   "(%d qubits available)\n",
-                   task->qid, b->name, b->total_qubits);
-            break;
-        }
+    spin_lock(&g_devinfo_lock);
+    memcpy(devinfo_snap, &g_dev_info, sizeof(*devinfo_snap));
+    spin_unlock(&g_devinfo_lock);
+
+    memset(phys, 0, sizeof(phys));
+
+    ret = alloc_do_strategy(task->alloc_strategy,
+                             task->num_qubits,
+                             devinfo_snap,
+                             task,
+                             &out_backend,
+                             &out_start,
+                             phys);
+    if (ret < 0) {
+        pr_warn("quantum_alloc: qid=%d no suitable backend "
+                "(need %d qubits, strategy=%d)\n",
+                task->qid, task->num_qubits, task->alloc_strategy);
+        task->error_code = QERR_NO_RESOURCE;
+        strncpy(task->error_info, "no available backend with sufficient qubits",
+                sizeof(task->error_info) - 1);
+        kfree(devinfo_snap);
+        return -ENODEV;
     }
-    spin_unlock(&backend_lock);
 
-    if (task->assigned_backend_id < 0) {
-        printk(KERN_WARNING "QuantumOS: [alloc] qid=%d no suitable "
-               "backend (need %d qubits)\n",
-               task->qid, need_qubits);
-        /* 不返回错误，允许进入队列等待资源 */
-    }
+    task->assigned_backend_id = out_backend;
+    memcpy(task->phys_qubits, phys, sizeof(task->phys_qubits));
+    task->fidelity_score = estimate_fidelity(out_backend,
+                                              task->num_qubits,
+                                              task->gate_count,
+                                              devinfo_snap);
 
+    pr_debug("quantum_alloc: qid=%d assigned backend=%d fidelity=%d\n",
+             task->qid, out_backend, task->fidelity_score);
+
+    kfree(devinfo_snap);
     return 0;
 }
 
+/* ============================================================
+ * 对外接口：sched调用（占用/释放/查找）
+ * ============================================================ */
+
 /*
- * 占用指定后端（由调度器在真正下发时调用）
+ * quantum_alloc_acquire —— 标记QPU为BUSY，sched在dispatch时调用
  */
 int quantum_alloc_acquire(int backend_id, int qid)
 {
-    struct quantum_backend *b;
+    unsigned long flags;
 
-    if (backend_id < 0 || backend_id >= g_backend_pool.num_backends)
+    if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
         return -EINVAL;
 
-    spin_lock(&backend_lock);
-    b = &g_backend_pool.backends[backend_id];
-    if (b->state != QBACKEND_STATE_IDLE) {
-        spin_unlock(&backend_lock);
+    spin_lock_irqsave(&g_alloc_lock, flags);
+    if (g_backend_pool.backends[backend_id].state != QBACKEND_STATE_IDLE) {
+        spin_unlock_irqrestore(&g_alloc_lock, flags);
         return -EBUSY;
     }
-    b->state       = QBACKEND_STATE_BUSY;
-    b->current_qid = qid;
-    spin_unlock(&backend_lock);
+    g_backend_pool.backends[backend_id].state       = QBACKEND_STATE_BUSY;
+    g_backend_pool.backends[backend_id].current_qid = qid;
+    spin_unlock_irqrestore(&g_alloc_lock, flags);
 
-    printk(KERN_INFO "QuantumOS: [alloc] %s acquired by qid=%d\n",
-           b->name, qid);
+    pr_debug("quantum_alloc: backend=%d acquired by qid=%d\n", backend_id, qid);
     return 0;
 }
 
 /*
- * 释放后端（任务完成或失败后调用）
+ * quantum_alloc_release —— 释放QPU，sched在commit时调用
  */
 void quantum_alloc_release(int backend_id)
 {
-    struct quantum_backend *b;
+    unsigned long flags;
 
-    if (backend_id < 0 || backend_id >= g_backend_pool.num_backends)
+    if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
         return;
 
-    spin_lock(&backend_lock);
-    b = &g_backend_pool.backends[backend_id];
-    b->state       = QBACKEND_STATE_IDLE;
-    b->current_qid = -1;
-    spin_unlock(&backend_lock);
+    spin_lock_irqsave(&g_alloc_lock, flags);
+    g_backend_pool.backends[backend_id].state       = QBACKEND_STATE_IDLE;
+    g_backend_pool.backends[backend_id].current_qid = -1;
+    spin_unlock_irqrestore(&g_alloc_lock, flags);
 
-    printk(KERN_INFO "QuantumOS: [alloc] %s released\n", b->name);
+    pr_debug("quantum_alloc: backend=%d released\n", backend_id);
 }
 
 /*
- * 为调度器提供：找一个满足条件的空闲QPU
- * 返回 backend_id，找不到返回 -1
+ * quantum_alloc_find_idle —— 快速查找满足qubit数的空闲QPU
+ * 返回backend_id，-1=无可用
+ * sched调度算法调用，使用FIRST_FIT策略（快速路径）
  */
 int quantum_alloc_find_idle(int need_qubits)
 {
-    int i;
-    struct quantum_backend *b;
-    int found = -1;
+    unsigned long flags;
+    int i, found = -1;
 
-    spin_lock(&backend_lock);
+    spin_lock_irqsave(&g_alloc_lock, flags);
     for (i = 0; i < g_backend_pool.num_backends; i++) {
-        b = &g_backend_pool.backends[i];
+        struct quantum_backend *b = &g_backend_pool.backends[i];
         if (b->state == QBACKEND_STATE_IDLE &&
             b->total_qubits >= need_qubits) {
-            found = b->id;
+            found = i;
             break;
         }
     }
-    spin_unlock(&backend_lock);
+    spin_unlock_irqrestore(&g_alloc_lock, flags);
     return found;
 }
 
-/* 暴露后端池给接口模块（用于 resource() API）*/
+/*
+ * quantum_alloc_find_best —— 保真度最优的空闲QPU
+ * 用于sched_weighted策略（里程碑6）
+ * 当前实现等同find_idle，里程碑6替换为保真度评分排序
+ */
+int quantum_alloc_find_best(const struct quantum_task_struct *task)
+{
+    /* 里程碑6：遍历所有IDLE后端，按fidelity_score排序 */
+    return quantum_alloc_find_idle(task->num_qubits);
+}
+
+/* ============================================================
+ * 对外接口：interface调用
+ * ============================================================ */
+
 void quantum_alloc_get_pool(struct quantum_backend_pool *out)
 {
-    spin_lock(&backend_lock);
+    unsigned long flags;
+
+    spin_lock_irqsave(&g_alloc_lock, flags);
     memcpy(out, &g_backend_pool, sizeof(*out));
-    spin_unlock(&backend_lock);
+    spin_unlock_irqrestore(&g_alloc_lock, flags);
+}
+
+/* ============================================================
+ * 对外接口：快照读取（preproc/sched调用）
+ * ============================================================ */
+
+void quantum_alloc_get_dev_info(struct quantum_dev_info *out)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&g_devinfo_lock, flags);
+    memcpy(out, &g_dev_info, sizeof(*out));
+    spin_unlock_irqrestore(&g_devinfo_lock, flags);
+}
+
+/* ============================================================
+ * 对外接口：calib调用（写入DevInfo）
+ * ============================================================ */
+
+void quantum_alloc_update_qubit(int qubit_id,
+                                 int available,
+                                 int t1_us_x10,
+                                 int t2_us_x10,
+                                 int r_fid_x1000,
+                                 int g1_fid_x1000,
+                                 int g2_fid_x1000)
+{
+    unsigned long flags;
+    struct quantum_qubit_info *q;
+
+    if (qubit_id < 0 || qubit_id >= QUANTUM_MAX_TOTAL_QUBITS)
+        return;
+
+    spin_lock_irqsave(&g_devinfo_lock, flags);
+    q = &g_dev_info.qubits[qubit_id];
+    q->available               = available;
+    q->t1_us_x10               = t1_us_x10;
+    q->t2_us_x10               = t2_us_x10;
+    q->readout_fidelity_x1000  = r_fid_x1000;
+    q->gate1_fidelity_x1000    = g1_fid_x1000;
+    q->gate2_fidelity_x1000    = g2_fid_x1000;
+    q->last_update_time        = ktime_get_ns();
+    g_dev_info.last_calibration_time = q->last_update_time;
+    spin_unlock_irqrestore(&g_devinfo_lock, flags);
+}
+
+/*
+ * quantum_alloc_update_qubit_topo —— 更新拓扑连接信息
+ * 里程碑6：calib实装后调用
+ */
+void quantum_alloc_update_qubit_topo(int qubit_id,
+                                      const int *neighbors,
+                                      int num_neighbors)
+{
+    unsigned long flags;
+    struct quantum_qubit_info *q;
+    int i, n;
+
+    if (qubit_id < 0 || qubit_id >= QUANTUM_MAX_TOTAL_QUBITS)
+        return;
+
+    n = (num_neighbors < QUANTUM_MAX_NEIGHBORS) ?
+         num_neighbors : QUANTUM_MAX_NEIGHBORS;
+
+    spin_lock_irqsave(&g_devinfo_lock, flags);
+    q = &g_dev_info.qubits[qubit_id];
+    q->num_neighbors = n;
+    for (i = 0; i < n; i++)
+        q->neighbors[i] = neighbors[i];
+    for (i = n; i < QUANTUM_MAX_NEIGHBORS; i++)
+        q->neighbors[i] = -1;
+    spin_unlock_irqrestore(&g_devinfo_lock, flags);
+}
+
+void quantum_alloc_set_backend_state(int backend_id, int state)
+{
+    unsigned long flags;
+
+    if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
+        return;
+
+    spin_lock_irqsave(&g_alloc_lock, flags);
+    g_backend_pool.backends[backend_id].state = state;
+    if (state == QBACKEND_STATE_IDLE)
+        g_backend_pool.backends[backend_id].current_qid = -1;
+    spin_unlock_irqrestore(&g_alloc_lock, flags);
+
+    pr_debug("quantum_alloc: backend=%d state→%d\n", backend_id, state);
 }

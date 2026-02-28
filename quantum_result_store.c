@@ -1,114 +1,125 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
 #include <linux/list.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+
 #include "quantum_types.h"
 
-/*
- * 结果存储节点
- * 任务完成后将结果从 quantum_task_struct 中摘出存入此处
- * 等待用户态 ioctl(QIOC_RESULT) 取走
- */
-struct qresult_node {
-    int                   qid;
-    int                   state;      /* QTASK_STATE_SUCCESS / FAILED */
+/* ============================================================
+ * 结果存储节点（对标zombie进程表条目）
+ * ============================================================ */
+
+struct result_entry {
+    int                  qid;
+    int                  state;         /* QTASK_STATE_SUCCESS/FAILED */
     struct quantum_result result;
-    struct list_head      list;
+    struct list_head     list;
 };
 
-static LIST_HEAD(result_store);
-static DEFINE_SPINLOCK(result_lock);
+static LIST_HEAD(g_result_list);
+static DEFINE_SPINLOCK(g_result_lock);
+
+/* ============================================================
+ * 对外接口
+ * ============================================================ */
 
 /*
- * 任务完成后由调度模块调用
- * 将结果存入结果表
+ * qresult_store_put —— 任务完成，存入结果
+ * 由 sched_commit 在 kfree(task) 前调用
+ * 注意：此函数在task释放前调用，复制必要字段
  */
 int qresult_store_put(struct quantum_task_struct *task)
 {
-    struct qresult_node *node;
+    struct result_entry *entry;
+    unsigned long flags;
 
-    node = kzalloc(sizeof(*node), GFP_KERNEL);
-    if (!node)
+    entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
+    if (!entry) {
+        pr_err("quantum_result_store: failed to alloc entry for qid=%d\n",
+               task->qid);
         return -ENOMEM;
+    }
 
-    node->qid   = task->qid;
-    node->state = task->state;
-    memcpy(&node->result, &task->result, sizeof(task->result));
+    entry->qid   = task->qid;
+    entry->state = task->state;
+    memcpy(&entry->result, &task->result, sizeof(entry->result));
 
-    spin_lock(&result_lock);
-    list_add_tail(&node->list, &result_store);
-    spin_unlock(&result_lock);
+    /* 若内核侧有error_code，同步到result */
+    if (task->error_code != QERR_OK) {
+        entry->result.error_code = task->error_code;
+        strncpy(entry->result.error_info, task->error_info,
+                sizeof(entry->result.error_info) - 1);
+    }
 
-    printk(KERN_INFO "QuantumOS: [result_store] stored qid=%d state=%d\n",
-           node->qid, node->state);
+    spin_lock_irqsave(&g_result_lock, flags);
+    list_add_tail(&entry->list, &g_result_list);
+    spin_unlock_irqrestore(&g_result_lock, flags);
+
+    pr_debug("quantum_result_store: stored qid=%d state=%d outcomes=%d\n",
+             entry->qid, entry->state, entry->result.num_outcomes);
     return 0;
 }
 
 /*
- * 用户态 ioctl(QIOC_STATUS) 调用
- * 返回任务状态，找不到返回 QTASK_STATE_UNKNOWN
+ * qresult_store_status —— 查询状态（interface STATUS ioctl调用）
+ * 返回 QTASK_STATE_SUCCESS/FAILED，或 -1=未找到
  */
 int qresult_store_status(int qid)
 {
-    struct qresult_node *node;   /* qresult_entry → qresult_node */
+    struct result_entry *entry;
     unsigned long flags;
-    int state = QTASK_STATE_UNKNOWN;
+    int state = -1;
 
-    spin_lock_irqsave(&result_lock, flags);          /* store_lock → result_lock */
-    list_for_each_entry(node, &result_store, list) { /* result_list → result_store */
-        if (node->qid == qid) {                      /* entry->task.qid → node->qid */
-            state = node->state;                     /* entry->task.state → node->state */
+    spin_lock_irqsave(&g_result_lock, flags);
+    list_for_each_entry(entry, &g_result_list, list) {
+        if (entry->qid == qid) {
+            state = entry->state;
             break;
         }
     }
-    spin_unlock_irqrestore(&result_lock, flags);
-
+    spin_unlock_irqrestore(&g_result_lock, flags);
     return state;
 }
 
 /*
- * 用户态 ioctl(QIOC_RESULT) 调用
- * 取走结果（取后从结果表删除）
- * 返回 0 成功，-ENOENT 未找到
+ * qresult_store_get —— 取回结果并从存储中删除
+ * 成功返回0，未找到返回-ENOENT
  */
 int qresult_store_get(int qid, struct quantum_result *out)
 {
-    struct qresult_node *node, *tmp;
+    struct result_entry *entry, *tmp;
+    unsigned long flags;
     int found = 0;
 
-    spin_lock(&result_lock);
-    list_for_each_entry_safe(node, tmp, &result_store, list) {
-        if (node->qid == qid) {
-            memcpy(out, &node->result, sizeof(*out));
-            list_del(&node->list);
-            kfree(node);
+    spin_lock_irqsave(&g_result_lock, flags);
+    list_for_each_entry_safe(entry, tmp, &g_result_list, list) {
+        if (entry->qid == qid) {
+            if (out)
+                memcpy(out, &entry->result, sizeof(*out));
+            list_del(&entry->list);
+            kfree(entry);
             found = 1;
             break;
         }
     }
-    spin_unlock(&result_lock);
+    spin_unlock_irqrestore(&g_result_lock, flags);
 
-    if (!found) {
-        printk(KERN_WARNING "QuantumOS: [result_store] qid=%d not found\n",
-               qid);
-        return -ENOENT;
-    }
-
-    printk(KERN_INFO "QuantumOS: [result_store] delivered qid=%d\n", qid);
-    return 0;
+    return found ? 0 : -ENOENT;
 }
 
 /*
- * 模块退出时清空结果表
+ * qresult_store_clear —— 清空所有结果（模块卸载时调用）
  */
 void qresult_store_clear(void)
 {
-    struct qresult_node *node, *tmp;
+    struct result_entry *entry, *tmp;
+    unsigned long flags;
 
-    spin_lock(&result_lock);
-    list_for_each_entry_safe(node, tmp, &result_store, list) {
-        list_del(&node->list);
-        kfree(node);
+    spin_lock_irqsave(&g_result_lock, flags);
+    list_for_each_entry_safe(entry, tmp, &g_result_list, list) {
+        list_del(&entry->list);
+        kfree(entry);
     }
-    spin_unlock(&result_lock);
+    spin_unlock_irqrestore(&g_result_lock, flags);
 }

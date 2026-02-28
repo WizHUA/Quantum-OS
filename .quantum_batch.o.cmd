@@ -200,11 +200,23 @@ deps_drivers/misc/quantum_os/quantum_batch.o := \
   include/linux/static_call_types.h \
     $(wildcard include/config/HAVE_STATIC_CALL) \
     $(wildcard include/config/HAVE_STATIC_CALL_INLINE) \
+  include/linux/string.h \
+    $(wildcard include/config/BINARY_PRINTF) \
+    $(wildcard include/config/FORTIFY_SOURCE) \
+  include/linux/err.h \
+  arch/x86/include/generated/uapi/asm/errno.h \
+  include/uapi/asm-generic/errno.h \
+  include/uapi/asm-generic/errno-base.h \
+  include/linux/errno.h \
+  include/uapi/linux/errno.h \
+  include/linux/overflow.h \
+  include/uapi/linux/string.h \
+  arch/x86/include/asm/string.h \
+  arch/x86/include/asm/string_64.h \
+    $(wildcard include/config/KASAN) \
+    $(wildcard include/config/ARCH_HAS_UACCESS_FLUSHCACHE) \
+  include/linux/fortify-string.h \
   drivers/misc/quantum_os/quantum_types.h \
-  include/uapi/linux/ioctl.h \
-  arch/x86/include/generated/uapi/asm/ioctl.h \
-  include/asm-generic/ioctl.h \
-  include/uapi/asm-generic/ioctl.h \
   include/linux/list.h \
     $(wildcard include/config/DEBUG_LIST) \
   include/linux/poison.h \
