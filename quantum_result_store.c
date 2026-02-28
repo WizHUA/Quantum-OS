@@ -50,18 +50,19 @@ int qresult_store_put(struct quantum_task_struct *task)
  */
 int qresult_store_status(int qid)
 {
-    struct qresult_entry *entry;
+    struct qresult_node *node;   /* qresult_entry → qresult_node */
     unsigned long flags;
     int state = QTASK_STATE_UNKNOWN;
 
-    spin_lock_irqsave(&store_lock, flags);
-    list_for_each_entry(entry, &result_list, list) {
-        if (entry->task.qid == qid) {
-            state = entry->task.state;
+    spin_lock_irqsave(&result_lock, flags);          /* store_lock → result_lock */
+    list_for_each_entry(node, &result_store, list) { /* result_list → result_store */
+        if (node->qid == qid) {                      /* entry->task.qid → node->qid */
+            state = node->state;                     /* entry->task.state → node->state */
             break;
         }
     }
-    spin_unlock_irqrestore(&store_lock, flags);
+    spin_unlock_irqrestore(&result_lock, flags);
+
     return state;
 }
 

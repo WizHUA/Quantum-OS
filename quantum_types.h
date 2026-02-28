@@ -11,6 +11,7 @@
 #define QUANTUM_MAX_TASKS           256
 #define QUANTUM_QIR_SIZE            4096
 #define QUANTUM_MAX_OUTCOMES        32      /* 缩减：256→32，足够演示 */
+#define QUANTUM_KEY_LEN             192
 #define QUANTUM_MAX_BACKENDS        8
 #define QUANTUM_MAX_SUB_CIRCUITS    8
 #define QUANTUM_SUB_QIR_SIZE        2048
@@ -72,7 +73,7 @@ struct quantum_result {
     int    qid;
     int    shots;
     int    num_outcomes;
-    char   keys[QUANTUM_MAX_OUTCOMES][96];  /* 32*32 = 1024B */
+    char   keys[QUANTUM_MAX_OUTCOMES][QUANTUM_KEY_LEN];  /* 32*192 = 6144B */
     int    counts[QUANTUM_MAX_OUTCOMES];    /* 32*4  = 128B  */
     int    error_code;
     char   error_info[128];
@@ -191,7 +192,7 @@ struct quantum_commit_req {
     int  success;
     int  shots;
     int  num_outcomes;
-    char keys[QUANTUM_MAX_OUTCOMES][96];
+    char keys[QUANTUM_MAX_OUTCOMES][QUANTUM_KEY_LEN];  /* 32*192 = 6144B */
     int  counts[QUANTUM_MAX_OUTCOMES];
     int  error_code;
     char error_info[128];

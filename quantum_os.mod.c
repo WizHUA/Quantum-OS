@@ -43,6 +43,7 @@ __used __section("__versions") = {
 	{ 0x18bfbaaf, "kthread_create_on_node" },
 	{ 0x6b10bee1, "_copy_to_user" },
 	{ 0x5b8239ca, "__x86_return_thunk" },
+	{ 0xfb578fc5, "memset" },
 	{ 0xd35cce70, "_raw_spin_unlock_irqrestore" },
 	{ 0x6aaedb85, "current_task" },
 	{ 0xbcab6ee6, "sscanf" },
@@ -75,4 +76,4 @@ __used __section("__versions") = {
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "9605D512D2F8AEF494C2FD5");
+MODULE_INFO(srcversion, "8A26040D61A17C1D2BFD4C8");
