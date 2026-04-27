@@ -527,16 +527,22 @@ struct quantum_calib_blob {
 
 /* ============================================================
  * 第十一部分：ioctl 命令字（ABI v3，§03.1）
- * 位于文件尾部以便 _IOWR 可以 sizeof 完整结构。
+ *
+ * Design choice: all cmd words use _IO (size = 0) so that:
+ *   1. Several ABI v3 payloads exceed _IOC's 14-bit (16 KiB) size limit
+ *      (quantum_dev_info, quantum_calib_blob with 8 KiB payload, etc.).
+ *   2. Userspace ABI discipline is enforced by qabi.py struct.pack format
+ *      strings + an explicit abi_version field embedded in each request.
+ * The 8-bit cmd numbers stay stable across struct-layout changes.
  * ============================================================ */
 
-#define QIOC_SUBMIT     _IOWR(QIOC_MAGIC, 1, struct quantum_submit_req)
-#define QIOC_STATUS     _IOWR(QIOC_MAGIC, 2, struct quantum_status_req)
-#define QIOC_RESULT     _IOWR(QIOC_MAGIC, 3, struct quantum_result_req)
-#define QIOC_CANCEL     _IOW (QIOC_MAGIC, 4, int)
-#define QIOC_RESOURCE   _IO  (QIOC_MAGIC, 5) /* size > _IOC limit; payload is struct quantum_dev_info */
-#define QIOC_FETCH      _IOWR(QIOC_MAGIC, 6, struct quantum_fetch_req)
-#define QIOC_COMMIT     _IOW (QIOC_MAGIC, 7, struct quantum_commit_req)
-#define QIOC_CALIB_LOAD _IOW (QIOC_MAGIC, 8, struct quantum_calib_blob)
+#define QIOC_SUBMIT     _IO(QIOC_MAGIC, 1) /* payload: struct quantum_submit_req */
+#define QIOC_STATUS     _IO(QIOC_MAGIC, 2) /* payload: struct quantum_status_req */
+#define QIOC_RESULT     _IO(QIOC_MAGIC, 3) /* payload: struct quantum_result_req */
+#define QIOC_CANCEL     _IO(QIOC_MAGIC, 4) /* payload: struct quantum_cancel_req */
+#define QIOC_RESOURCE   _IO(QIOC_MAGIC, 5) /* payload: struct quantum_dev_info   */
+#define QIOC_FETCH      _IO(QIOC_MAGIC, 6) /* payload: struct quantum_fetch_req  */
+#define QIOC_COMMIT     _IO(QIOC_MAGIC, 7) /* payload: struct quantum_commit_req */
+#define QIOC_CALIB_LOAD _IO(QIOC_MAGIC, 8) /* payload: struct quantum_calib_blob */
 
 #endif /* QUANTUM_TYPES_H */
