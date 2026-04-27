@@ -7,6 +7,8 @@
 #include "quantum_types.h"
 
 /* 前向声明：各模块init/exit */
+int  quantum_result_store_init(void);
+void quantum_result_store_exit(void);
 int  quantum_alloc_init(void);
 void quantum_alloc_exit(void);
 int  quantum_sched_init(void);
@@ -22,11 +24,18 @@ static int __init quantum_os_init(void)
 
     pr_info("quantum_os: initializing\n");
 
+    /* 0. result_store 必须最先初始化（其他模块写入 qernel/task 表，§02.1） */
+    ret = quantum_result_store_init();
+    if (ret) {
+        pr_err("quantum_os: result_store init failed: %d\n", ret);
+        return ret;
+    }
+
     /* 1. alloc首先初始化（其他模块依赖DevInfo和backend pool） */
     ret = quantum_alloc_init();
     if (ret) {
         pr_err("quantum_os: alloc init failed: %d\n", ret);
-        return ret;
+        goto err_alloc;
     }
 
     /* 2. sched初始化（启动kthread，依赖alloc） */
@@ -60,6 +69,8 @@ err_calib:
     quantum_sched_exit();
 err_sched:
     quantum_alloc_exit();
+err_alloc:
+    quantum_result_store_exit();
     return ret;
 }
 
@@ -72,6 +83,7 @@ static void __exit quantum_os_exit(void)
     quantum_calib_exit();
     quantum_sched_exit();
     quantum_alloc_exit();
+    quantum_result_store_exit();
 
     pr_info("quantum_os: shutdown complete\n");
 }
