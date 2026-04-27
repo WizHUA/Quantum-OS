@@ -1,1 +1,0 @@
-cmd_drivers/misc/quantum_os/quantum_os.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o drivers/misc/quantum_os/quantum_os.ko drivers/misc/quantum_os/quantum_os.o drivers/misc/quantum_os/quantum_os.mod.o;  true

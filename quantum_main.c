@@ -50,8 +50,8 @@ static int __init quantum_os_init(void)
         goto err_interface;
     }
 
-    pr_info("quantum_os: initialized successfully, /dev/%s ready\n",
-            QUANTUM_DEV_NAME);
+    pr_info("[main] framework ready abi=%d dev=/dev/%s\n",
+            QUANTUM_ABI_VERSION, QUANTUM_DEV_NAME);
     return 0;
 
 err_interface:

@@ -9,13 +9,17 @@
  * ============================================================ */
 
 #define QUANTUM_DEV_NAME            "quantum"
+#define QUANTUM_ABI_VERSION         3   /* restart-phase ABI; bump from v2 */
 #define QUANTUM_MAX_QUBITS          64
 #define QUANTUM_MAX_TASKS           256
+#define QUANTUM_MAX_QERNELS         256 /* qernel_table size */
 #define QUANTUM_QIR_SIZE            4096
-#define QUANTUM_MAX_OUTCOMES        32
+#define QUANTUM_MAX_OUTCOMES        64  /* bumped 32 -> 64 for v3 */
 #define QUANTUM_KEY_LEN             192
 #define QUANTUM_MAX_BACKENDS        8
 #define QUANTUM_MAX_SUB_CIRCUITS    8
+#define QUANTUM_MAX_FRAGMENTS       QUANTUM_MAX_SUB_CIRCUITS /* alias per restart spec */
+#define QUANTUM_MAX_VARIANTS        16  /* per fragment, EM expansion */
 #define QUANTUM_SUB_QIR_SIZE        2048
 #define QUANTUM_MAX_TOTAL_QUBITS    (QUANTUM_MAX_QUBITS * QUANTUM_MAX_BACKENDS)
 #define QUANTUM_MAX_NEIGHBORS       8
@@ -63,11 +67,33 @@
 #define QMIT_CDR                    2
 #define QMIT_PEC                    3
 
+/* ABI v3: cut kind (preproc decision) */
+#define QCUT_NONE                   0
+#define QCUT_WIRE                   1
+#define QCUT_GATE                   2
+#define QCUT_AUTO                   3   /* preproc decides */
+
+/* ABI v3: error-mitigation kind (Manifest.em_kind) */
+#define QEM_NONE                    0
+#define QEM_READOUT                 1
+#define QEM_ZNE                     2
+#define QEM_PEC                     3
+
+/* ABI v3: postproc reconstruct rule (Manifest.reconstruct_rule) */
+#define QRECON_DIRECT               0
+#define QRECON_TENSOR               1
+#define QRECON_QUASI_PROB           2
+
+/* ABI v3: quantum_value.kind */
+#define QVAL_COUNTS                 0
+#define QVAL_EXPECTATION            1
+#define QVAL_DISTRIBUTION           2
+
 /* ============================================================
  * 第三部分：状态码与类型码
  * ============================================================ */
 
-/* 任务状态 */
+/* 任务状态 (legacy v2 names — kept for in-flight modules) */
 #define QTASK_STATE_UNKNOWN         0
 #define QTASK_STATE_RECEIVED        1
 #define QTASK_STATE_QUEUED          2
@@ -76,6 +102,29 @@
 #define QTASK_STATE_FAILED          5
 #define QTASK_STATE_CANCELLED       6
 #define QTASK_STATE_MERGING         7
+
+/* ABI v3: Qernel lifecycle (§01.2) — owned by qernel_table_set_state */
+#define QSTATE_UNKNOWN              0
+#define QSTATE_RECEIVED             1
+#define QSTATE_PREPARED             2
+#define QSTATE_ASSIGNED             3
+#define QSTATE_BUNDLED              4
+#define QSTATE_RUNNING              5
+#define QSTATE_EM_COMBINING         6
+#define QSTATE_RECONSTRUCTING       7
+#define QSTATE_DONE                 8
+#define QSTATE_FAILED               9
+#define QSTATE_CANCELLED            10
+
+/* ABI v3: per-fragment-variant (task_row) state */
+#define QVSTATE_UNKNOWN             0
+#define QVSTATE_PREPARED            1
+#define QVSTATE_ASSIGNED            2
+#define QVSTATE_BUNDLED             3
+#define QVSTATE_RUNNING             4
+#define QVSTATE_DONE_VAR            5
+#define QVSTATE_FAILED_VAR          6
+#define QVSTATE_CANCELLED_VAR       7
 
 /* 任务类型 */
 #define QTASK_TYPE_NORMAL           0
@@ -102,17 +151,10 @@
 #define QERR_UNKNOWN                99
 
 /* ============================================================
- * 第四部分：ioctl命令字
+ * 第四部分：ioctl命令字（仅 magic；命令字定义在文件尾部以便 _IOWR 使用完整 struct 类型）
  * ============================================================ */
 
 #define QIOC_MAGIC      'Q'
-#define QIOC_SUBMIT     _IO(QIOC_MAGIC, 1)
-#define QIOC_STATUS     _IO(QIOC_MAGIC, 2)
-#define QIOC_RESULT     _IO(QIOC_MAGIC, 3)
-#define QIOC_CANCEL     _IO(QIOC_MAGIC, 4)
-#define QIOC_RESOURCE   _IO(QIOC_MAGIC, 5)
-#define QIOC_FETCH      _IO(QIOC_MAGIC, 6)
-#define QIOC_COMMIT     _IO(QIOC_MAGIC, 7)
 
 /* ============================================================
  * 第五部分：硬件描述符
@@ -355,5 +397,146 @@ struct quantum_result_req {
 struct quantum_cancel_req {
     int     qid;
 };
+
+/* ============================================================
+ * 第十部分：ABI v3 新增结构（§01 数据模型 + §03 ABI）
+ * 与第三/八/九部分的 v2 结构并存，迁移完成后可送接。
+ * ============================================================ */
+
+/* ---------- (a) Manifest: preproc 权威切分/EM 计划 ---------- */
+struct quantum_manifest {
+    __u32   abi_version;
+    __u8    cut_kind;          /* QCUT_NONE / QCUT_WIRE / QCUT_GATE */
+    __u8    em_kind;           /* QEM_NONE / QEM_READOUT / QEM_ZNE / QEM_PEC */
+    __u8    num_fragments;     /* 1..QUANTUM_MAX_FRAGMENTS */
+    __u8    reconstruct_rule;  /* QRECON_DIRECT / QRECON_TENSOR / QRECON_QUASI_PROB */
+
+    struct {
+        __u8    num_variants;        /* fragments × variants = sub-jobs */
+        __s32   weight_num[QUANTUM_MAX_VARIANTS]; /* signed quasi-prob numerator */
+        __u32   weight_den[QUANTUM_MAX_VARIANTS]; /* common denominator scaled ×1000 */
+        __u8    qubit_count;
+        __u8    classical_count;
+        __u16   depth_estimate;
+    } fragment[QUANTUM_MAX_FRAGMENTS];
+};
+
+/* ---------- (b) QernelResult: postproc 最终产物 ---------- */
+struct quantum_value {
+    __u8    kind;              /* QVAL_COUNTS / QVAL_EXPECTATION / QVAL_DISTRIBUTION */
+    __u32   total_shots;
+    __u16   num_outcomes;
+    char    keys[QUANTUM_MAX_OUTCOMES][QUANTUM_KEY_LEN];
+    __s64   counts_x1000[QUANTUM_MAX_OUTCOMES]; /* allow negative for quasi-prob */
+};
+
+struct quantum_stats {
+    __u64   submit_ns;
+    __u64   first_dispatch_ns;
+    __u64   finish_ns;
+    __u32   num_fragments;
+    __u32   num_variants_total;
+    __u32   em_overhead_x1000;       /* ratio of variants/fragment */
+    __u32   barrier_wait_ns;
+    __u32   reconstruct_ns;
+    char    backend_used[QUANTUM_MAX_FRAGMENTS][32]; /* per-fragment */
+};
+
+struct quantum_qernel_result {
+    int                          qid;
+    int                          error_code;
+    char                         error_info[128];
+    struct quantum_value         value;
+    struct quantum_stats         stats;
+};
+
+/* ---------- (c) Provenance tag：FETCH 打出，COMMIT 返回 ---------- */
+struct quantum_provenance {
+    __u32   qid;
+    __u8    fragment_index;
+    __u8    variant_index;
+    __u32   variant_seed;
+    __s32   variant_weight_num;
+    __u32   variant_weight_den;
+    __u32   shots;
+    char    backend_assigned[32];
+};
+
+/* ---------- (d) Kernel Data Space rows（§03.4） ---------- */
+struct quantum_qernel_row {
+    int     qid;
+    int     state;                       /* QSTATE_* */
+    int     error_code;
+    char    error_info[128];
+    /* user request */
+    int     priority;
+    int     shots;
+    int     em_kind;
+    int     cut_hint;
+    /* preproc output */
+    struct quantum_manifest manifest;
+    /* aggregated bookkeeping */
+    __u32   num_variants_total;
+    __u32   num_variants_done;
+    __u32   num_fragments_done;
+    /* timings */
+    __u64   submit_ns;
+    __u64   first_dispatch_ns;
+    __u64   barrier_ready_ns;
+    __u64   finish_ns;
+    /* final */
+    struct quantum_qernel_result result;
+    /* control */
+    int     cancel_requested;
+    /* original QASM (debug + replay) */
+    char    qasm[QUANTUM_QIR_SIZE];
+};
+
+struct quantum_task_row {
+    struct quantum_provenance prov;      /* qid + frag + var */
+    int     state;                       /* QVSTATE_* */
+    int     assigned_backend_id;         /* -1 until alloc sets */
+    int     phys_qubits[QUANTUM_MAX_QUBITS];
+    int     bundle_id;                   /* -1 until batch sets */
+    char    qasm[QUANTUM_SUB_QIR_SIZE];
+    struct quantum_result result;        /* set on COMMIT */
+    __u64   assigned_ns;
+    __u64   bundled_ns;
+    __u64   dispatched_ns;
+    __u64   committed_ns;
+};
+
+/* ---------- (e) ABI v3 user-facing ioctl payloads ---------- */
+struct quantum_submit_req {
+    __u32   abi_version;
+    int     priority;            /* 0..9 */
+    int     shots;
+    int     error_mitigation;    /* QMIT_*  */
+    int     alloc_strategy;      /* QALLOC_STRATEGY_* */
+    int     cut_hint;            /* QCUT_NONE / QCUT_WIRE / QCUT_AUTO */
+    char    qasm[QUANTUM_QIR_SIZE];
+    /* OUT */
+    int     qid;
+};
+
+struct quantum_calib_blob {
+    __u32   abi_version;
+    __u32   num_backends;
+    char    payload[8192]; /* daemon-side device_params.json blob */
+};
+
+/* ============================================================
+ * 第十一部分：ioctl 命令字（ABI v3，§03.1）
+ * 位于文件尾部以便 _IOWR 可以 sizeof 完整结构。
+ * ============================================================ */
+
+#define QIOC_SUBMIT     _IOWR(QIOC_MAGIC, 1, struct quantum_submit_req)
+#define QIOC_STATUS     _IOWR(QIOC_MAGIC, 2, struct quantum_status_req)
+#define QIOC_RESULT     _IOWR(QIOC_MAGIC, 3, struct quantum_result_req)
+#define QIOC_CANCEL     _IOW (QIOC_MAGIC, 4, int)
+#define QIOC_RESOURCE   _IO  (QIOC_MAGIC, 5) /* size > _IOC limit; payload is struct quantum_dev_info */
+#define QIOC_FETCH      _IOWR(QIOC_MAGIC, 6, struct quantum_fetch_req)
+#define QIOC_COMMIT     _IOW (QIOC_MAGIC, 7, struct quantum_commit_req)
+#define QIOC_CALIB_LOAD _IOW (QIOC_MAGIC, 8, struct quantum_calib_blob)
 
 #endif /* QUANTUM_TYPES_H */

@@ -1,1 +1,0 @@
-cmd_drivers/misc/quantum_os/Module.symvers := sed 's/\.ko$$/\.o/' drivers/misc/quantum_os/modules.order | scripts/mod/modpost -m -a  -o drivers/misc/quantum_os/Module.symvers -e -i Module.symvers   -T -
