@@ -12,6 +12,19 @@
 
 #include "quantum_types.h"
 
+/* ------------------------------------------------------------------
+ * Forward declarations for the ABI v3 store, defined further below.
+ * The legacy qresult_store_put() shims into the new tables, so it
+ * needs visibility before the static definitions appear.
+ * ------------------------------------------------------------------ */
+struct task_node;
+struct qernel_slot;
+extern struct qernel_slot   *g_qernel_table;
+extern bool                  g_store_inited;
+extern struct mutex          g_store_mtx;
+struct quantum_qernel_row *qernel_table_get_locked(int qid);
+static void qernel_table_wake_locked(int qid);
+
 /* ============================================================
  * 结果存储节点（对标zombie进程表条目）
  * ============================================================ */
@@ -39,6 +52,8 @@ int qresult_store_put(struct quantum_task_struct *task)
 {
     struct result_entry *entry;
     unsigned long flags;
+    int qid;
+    int legacy_state;
 
     entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
     if (!entry) {
@@ -64,6 +79,57 @@ int qresult_store_put(struct quantum_task_struct *task)
 
     pr_debug("quantum_result_store: stored qid=%d state=%d outcomes=%d\n",
              entry->qid, entry->state, entry->result.num_outcomes);
+
+    /*
+     * Bridge to ABI v3 qernel_table: if interface previously created a
+     * qernel_row for this qid, mirror the legacy terminal state into it
+     * so that QIOC_RESULT (new path) can wake and copy the result back.
+     * This shim disappears in M6 once sched writes the table directly.
+     */
+    qid = task->qid;
+    legacy_state = task->state;
+    if (g_store_inited && qid > 0 && qid <= QUANTUM_MAX_QERNELS) {
+        struct quantum_qernel_row *row;
+        bool wake = false;
+        int target_state = QSTATE_DONE;
+        int i, n;
+
+        if (legacy_state == QTASK_STATE_FAILED ||
+            entry->result.error_code != QERR_OK)
+            target_state = QSTATE_FAILED;
+        else if (legacy_state == QTASK_STATE_CANCELLED)
+            target_state = QSTATE_CANCELLED;
+
+        mutex_lock(&g_store_mtx);
+        row = qernel_table_get_locked(qid);
+        if (row) {
+            row->result.qid = qid;
+            row->result.error_code = entry->result.error_code;
+            strncpy(row->result.error_info, entry->result.error_info,
+                    sizeof(row->result.error_info) - 1);
+            row->result.value.kind = QVAL_COUNTS;
+            row->result.value.total_shots = entry->result.shots;
+            n = entry->result.num_outcomes;
+            if (n > QUANTUM_MAX_OUTCOMES)
+                n = QUANTUM_MAX_OUTCOMES;
+            row->result.value.num_outcomes = (__u16)n;
+            for (i = 0; i < n; i++) {
+                memcpy(row->result.value.keys[i],
+                       entry->result.keys[i], QUANTUM_KEY_LEN);
+                row->result.value.counts_x1000[i] =
+                    (__s64)entry->result.counts[i] * 1000;
+            }
+            row->state = target_state;
+            row->finish_ns = ktime_get_ns();
+            row->result.stats.finish_ns = row->finish_ns;
+            row->result.stats.submit_ns = row->submit_ns;
+            wake = true;
+        }
+        mutex_unlock(&g_store_mtx);
+        if (wake)
+            qernel_table_wake_locked(qid);
+    }
+
     return 0;
 }
 
@@ -164,10 +230,16 @@ struct qernel_slot {
     wait_queue_head_t       result_waitq;
 };
 
-static struct qernel_slot   *g_qernel_table;     /* size = QUANTUM_MAX_QERNELS+1 */
-static DEFINE_MUTEX(g_store_mtx);
+struct qernel_slot          *g_qernel_table;     /* size = QUANTUM_MAX_QERNELS+1 */
+DEFINE_MUTEX(g_store_mtx);
 static atomic_t              g_next_qid = ATOMIC_INIT(0);
-static bool                  g_store_inited;
+bool                         g_store_inited;
+
+static void qernel_table_wake_locked(int qid)
+{
+    if (qid > 0 && qid <= QUANTUM_MAX_QERNELS && g_qernel_table)
+        wake_up_interruptible_all(&g_qernel_table[qid].result_waitq);
+}
 
 /* -------- state-machine helpers -------- */
 

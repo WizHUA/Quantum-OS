@@ -38,6 +38,32 @@ int qresult_store_get(int qid, struct quantum_result *out);
 void qresult_store_clear(void);
 int qresult_store_put(struct quantum_task_struct *task);
 
+/* ABI v3 (§03.4) */
+int  qernel_table_alloc_qid(void);
+int  qernel_table_snapshot(int qid, struct quantum_qernel_row *out);
+int  qernel_table_set_state(int qid, int new_state);
+int  qernel_table_set_cancel(int qid);
+int  qernel_table_wait_terminal(int qid, long timeout_jiffies);
+void qernel_table_release(int qid);
+
+/* Map ABI v3 QSTATE_* to legacy QTASK_STATE_* for userspace continuity. */
+static int qstate_to_legacy(int s)
+{
+    switch (s) {
+    case QSTATE_RECEIVED:       return QTASK_STATE_RECEIVED;
+    case QSTATE_PREPARED:
+    case QSTATE_ASSIGNED:
+    case QSTATE_BUNDLED:        return QTASK_STATE_QUEUED;
+    case QSTATE_RUNNING:        return QTASK_STATE_RUNNING;
+    case QSTATE_EM_COMBINING:
+    case QSTATE_RECONSTRUCTING: return QTASK_STATE_RUNNING;
+    case QSTATE_DONE:           return QTASK_STATE_SUCCESS;
+    case QSTATE_FAILED:         return QTASK_STATE_FAILED;
+    case QSTATE_CANCELLED:      return QTASK_STATE_CANCELLED;
+    default:                    return QTASK_STATE_UNKNOWN;
+    }
+}
+
 
 /* ============================================================
  * 内部：配置头解析
@@ -142,6 +168,79 @@ static void submit_chain_fail(struct quantum_task_struct *task)
      */
     qresult_store_put(task);
     kfree(task);
+}
+
+/* ============================================================
+ * Submit chain (shared between legacy write() and QIOC_SUBMIT).
+ *
+ * Builds a quantum_task_struct, runs preproc/alloc/batch, then enqueues to
+ * sched. Caller-supplied qid lets QIOC_SUBMIT pre-allocate a qernel_table
+ * row and have the legacy chain operate under the same identity.
+ *
+ * Returns >0 (qid) on success; <0 errno on failure.
+ * ============================================================ */
+static int submit_chain_run(int qid_in,
+                            const char *qir,
+                            int shots, int priority,
+                            int mitigation, int alloc_strategy,
+                            int split_strategy)
+{
+    struct quantum_task_struct *task;
+    int qid = qid_in;
+    int ret;
+
+    task = kzalloc(sizeof(*task), GFP_KERNEL);
+    if (!task)
+        return -ENOMEM;
+
+    if (qid <= 0)
+        qid = quantum_sched_alloc_qid();
+
+    task->qid              = qid;
+    task->task_type        = QTASK_TYPE_NORMAL;
+    task->priority         = priority;
+    task->shots            = shots;
+    task->error_mitigation = mitigation;
+    task->alloc_strategy   = alloc_strategy;
+    task->split_strategy   = split_strategy;
+    task->submit_time      = ktime_get_ns();
+    task->state            = QTASK_STATE_RECEIVED;
+    task->assigned_backend_id = -1;
+    task->batch_group_id   = -1;
+    task->error_code       = QERR_OK;
+    INIT_LIST_HEAD(&task->list);
+
+    strncpy(task->qir, qir, QUANTUM_QIR_SIZE - 1);
+    task->qir[QUANTUM_QIR_SIZE - 1] = '\0';
+
+    pr_info("[interface] qid=%d submit shots=%d priority=%d em=%d alloc=%d cut_hint=%d\n",
+            qid, shots, priority, mitigation, alloc_strategy, split_strategy);
+
+    ret = quantum_preproc_run(task);
+    if (ret) {
+        pr_err("[interface] qid=%d preproc failed err=%d\n", qid, ret);
+        submit_chain_fail(task);
+        return -EINVAL;
+    }
+    ret = quantum_alloc_run(task);
+    if (ret) {
+        pr_err("[interface] qid=%d alloc failed err=%d\n", qid, ret);
+        submit_chain_fail(task);
+        return -EBUSY;
+    }
+    ret = quantum_batch_run(task);
+    if (ret) {
+        pr_err("[interface] qid=%d batch failed err=%d\n", qid, ret);
+        submit_chain_fail(task);
+        return -EINVAL;
+    }
+    ret = quantum_sched_enqueue(task);
+    if (ret) {
+        pr_err("[interface] qid=%d enqueue failed err=%d\n", qid, ret);
+        submit_chain_fail(task);
+        return -EBUSY;
+    }
+    return qid;
 }
 
 /* ============================================================
@@ -367,21 +466,31 @@ static long quantum_ioctl(struct file *filp,
 
     case QIOC_STATUS: {
         struct quantum_status_req req;
+        struct quantum_qernel_row *snap;
         int state;
 
         if (copy_from_user(&req, uarg, sizeof(req)))
             return -EFAULT;
 
-        state = quantum_sched_query_state(req.qid);
-
-        if (state == QTASK_STATE_UNKNOWN)
-            state = qresult_store_status(req.qid);
-
-        if (state == QTASK_STATE_MERGING)
-            state = QTASK_STATE_RUNNING;
-
-        if (state < 0)
-            state = QTASK_STATE_UNKNOWN;
+        /* Prefer ABI v3 qernel_table; fall back to legacy paths. */
+        snap = kzalloc(sizeof(*snap), GFP_KERNEL);
+        if (!snap)
+            return -ENOMEM;
+        if (qernel_table_snapshot(req.qid, snap) == 0) {
+            state = qstate_to_legacy(snap->state);
+            kfree(snap);
+            pr_info("[interface] qid=%d status state=%d (qernel_table)\n",
+                    req.qid, state);
+        } else {
+            kfree(snap);
+            state = quantum_sched_query_state(req.qid);
+            if (state == QTASK_STATE_UNKNOWN)
+                state = qresult_store_status(req.qid);
+            if (state == QTASK_STATE_MERGING)
+                state = QTASK_STATE_RUNNING;
+            if (state < 0)
+                state = QTASK_STATE_UNKNOWN;
+        }
 
         req.state = state;
         if (copy_to_user(uarg, &req, sizeof(req)))
@@ -428,7 +537,10 @@ static long quantum_ioctl(struct file *filp,
         if (copy_from_user(&req, uarg, sizeof(req)))
             return -EFAULT;
 
+        /* Mark cancellation in qernel_table (best-effort) before signaling sched. */
+        (void)qernel_table_set_cancel(req.qid);
         ret = quantum_sched_cancel(req.qid);
+        pr_info("[interface] qid=%d cancel requested ret=%d\n", req.qid, ret);
         break;
     }
 
@@ -489,6 +601,82 @@ static long quantum_ioctl(struct file *filp,
 
         ret = quantum_sched_commit(creq);
         kfree(creq);
+        break;
+    }
+
+    /* ── QIOC_SUBMIT (ABI v3 §02.2)：单 ioctl 提交，结果回填 qid ── */
+    case QIOC_SUBMIT: {
+        struct quantum_submit_req *sreq;
+        const char *qir_body;
+        int qid_pre;
+
+        sreq = kzalloc(sizeof(*sreq), GFP_KERNEL);
+        if (!sreq)
+            return -ENOMEM;
+        if (copy_from_user(sreq, uarg, sizeof(*sreq))) {
+            kfree(sreq);
+            return -EFAULT;
+        }
+        if (sreq->abi_version != QUANTUM_ABI_VERSION) {
+            pr_warn("[interface] submit rejected: abi=%u expected=%d\n",
+                    sreq->abi_version, QUANTUM_ABI_VERSION);
+            kfree(sreq);
+            return -EINVAL;
+        }
+        if (sreq->shots < 1 || sreq->shots > (1 << 20)) {
+            kfree(sreq);
+            return -EINVAL;
+        }
+        if (sreq->priority < 0 || sreq->priority > 9)
+            sreq->priority = 0;
+        if (sreq->error_mitigation < QMIT_NONE ||
+            sreq->error_mitigation > QMIT_PEC)
+            sreq->error_mitigation = QMIT_NONE;
+        sreq->qasm[QUANTUM_QIR_SIZE - 1] = '\0';
+        if (!is_valid_qasm(sreq->qasm)) {
+            kfree(sreq);
+            return -EINVAL;
+        }
+
+        /* Pre-allocate qernel_table row so qid identity is shared with the
+         * legacy submit chain.  Failure here is a fatal -ENOSPC. */
+        qid_pre = qernel_table_alloc_qid();
+        if (qid_pre < 0) {
+            kfree(sreq);
+            return qid_pre;
+        }
+
+        /* Strip optional first-line config header (legacy compatibility):
+         * QIOC_SUBMIT carries config in struct fields, so skip any header. */
+        qir_body = sreq->qasm;
+        if (strncmp(qir_body, "shots=", 6) == 0 ||
+            strncmp(qir_body, "priority=", 9) == 0 ||
+            strncmp(qir_body, "mitigation=", 11) == 0) {
+            const char *nl = strchr(qir_body, '\n');
+            if (nl)
+                qir_body = nl + 1;
+        }
+
+        ret = submit_chain_run(qid_pre, qir_body,
+                               sreq->shots, sreq->priority,
+                               sreq->error_mitigation,
+                               QALLOC_STRATEGY_FIRST_FIT,
+                               (sreq->cut_hint == QCUT_WIRE)
+                                   ? QSPLIT_STRATEGY_SPACE_NAIVE
+                                   : QSPLIT_STRATEGY_NONE);
+        if (ret < 0) {
+            qernel_table_release(qid_pre);
+            kfree(sreq);
+            return ret;
+        }
+
+        sreq->qid = ret;
+        if (copy_to_user(uarg, sreq, sizeof(*sreq))) {
+            kfree(sreq);
+            return -EFAULT;
+        }
+        kfree(sreq);
+        ret = 0;
         break;
     }
 
