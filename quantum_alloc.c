@@ -212,53 +212,73 @@ static int estimate_fidelity(int backend_id,
 
 int quantum_alloc_init(void)
 {
-    int i, j;
+    int b, i, j, base;
+    /*
+     * Default backend table — SSOT §04 / pre-M3 review B-3 require at
+     * least two distinct backends so alloc has an observable choice and
+     * downstream batch can demonstrate cross-backend cluster placement.
+     * Real values are overridden by QIOC_CALIB_LOAD (M8); this is the
+     * built-in seed so the demo and `qctl resource` work out of the box.
+     */
+    static const struct {
+        const char *name;
+        int total_qubits;
+        int fidelity_score;     /* x1000 */
+        int connectivity_type;  /* 0 full, 1 NN, 2 heavy-hex */
+    } seed[] = {
+        { "aer0", QUANTUM_MAX_QUBITS, 990, 0 }, /* high-fidelity ideal sim */
+        { "aer1", QUANTUM_MAX_QUBITS, 940, 2 }, /* heavy-hex, slightly noisier */
+    };
+    const int N = (int)(sizeof(seed) / sizeof(seed[0]));
 
     memset(&g_backend_pool, 0, sizeof(g_backend_pool));
     memset(&g_dev_info,     0, sizeof(g_dev_info));
 
-    /* 初始化一个模拟后端（sim0） */
-    g_backend_pool.num_backends = 1;
+    g_backend_pool.num_backends = N;
+    g_dev_info.num_backends     = N;
+    g_dev_info.total_qubits     = N * QUANTUM_MAX_QUBITS;
 
-    g_backend_pool.backends[0].id           = 0;
-    strncpy(g_backend_pool.backends[0].name, "sim0",
-            sizeof(g_backend_pool.backends[0].name) - 1);
-    g_backend_pool.backends[0].total_qubits     = QUANTUM_MAX_QUBITS;
-    g_backend_pool.backends[0].state            = QBACKEND_STATE_IDLE;
-    g_backend_pool.backends[0].current_qid      = -1;
-    g_backend_pool.backends[0].fidelity_score   = 1000; /* 模拟器理想保真度 */
-    g_backend_pool.backends[0].num_qubits_available = QUANTUM_MAX_QUBITS;
-    g_backend_pool.backends[0].connectivity_type = 0;   /* 全连接 */
+    for (b = 0; b < N; b++) {
+        struct quantum_backend *bk = &g_backend_pool.backends[b];
 
-    /* 初始化DevInfo（sim0的所有qubit设为理想可用状态） */
-    g_dev_info.num_backends = 1;
-    g_dev_info.total_qubits = QUANTUM_MAX_QUBITS;
+        bk->id           = b;
+        strncpy(bk->name, seed[b].name, sizeof(bk->name) - 1);
+        bk->total_qubits          = seed[b].total_qubits;
+        bk->state                 = QBACKEND_STATE_IDLE;
+        bk->current_qid           = -1;
+        bk->fidelity_score        = seed[b].fidelity_score;
+        bk->num_qubits_available  = seed[b].total_qubits;
+        bk->connectivity_type     = seed[b].connectivity_type;
 
-    for (i = 0; i < QUANTUM_MAX_QUBITS; i++) {
-        struct quantum_qubit_info *q = &g_dev_info.qubits[i];
-        q->qubit_id  = i;
-        q->backend_id = 0;
-        q->local_id  = i;
-        q->available = 1;
+        base = b * QUANTUM_MAX_QUBITS;
+        for (i = 0; i < QUANTUM_MAX_QUBITS; i++) {
+            struct quantum_qubit_info *q = &g_dev_info.qubits[base + i];
+            q->qubit_id   = base + i;
+            q->backend_id = b;
+            q->local_id   = i;
+            q->available  = 1;
 
-        /* 模拟器：理想参数 */
-        q->t1_us_x10               = 1000; /* 100 μs */
-        q->t2_us_x10               = 1000;
-        q->readout_fidelity_x1000  = 1000;
-        q->gate1_fidelity_x1000    = 1000;
-        q->gate2_fidelity_x1000    = 1000;
+            q->t1_us_x10              = 1000;                /* 100 us */
+            q->t2_us_x10              = 1000;
+            q->readout_fidelity_x1000 = seed[b].fidelity_score;
+            q->gate1_fidelity_x1000   = seed[b].fidelity_score;
+            q->gate2_fidelity_x1000   = seed[b].fidelity_score - 10;
 
-        /* 拓扑：全连接（邻居为所有其他qubit，仅填前QUANTUM_MAX_NEIGHBORS个） */
-        q->num_neighbors = 0;
-        for (j = 0; j < QUANTUM_MAX_NEIGHBORS; j++)
-            q->neighbors[j] = -1;
+            q->num_neighbors = 0;
+            for (j = 0; j < QUANTUM_MAX_NEIGHBORS; j++)
+                q->neighbors[j] = -1;
 
-        q->coupling_map    = 0;
-        q->last_update_time = 0;
+            q->coupling_map     = 0;
+            q->last_update_time = 0;
+        }
     }
 
-    pr_info("quantum_alloc: initialized, %d backend(s), %d qubits\n",
+    pr_info("quantum_alloc: initialized, %d backend(s), %d qubits total\n",
             g_backend_pool.num_backends, g_dev_info.total_qubits);
+    for (b = 0; b < N; b++)
+        pr_info("quantum_alloc:   [%d] %s qubits=%d fidelity=%d conn=%d\n",
+                b, seed[b].name, seed[b].total_qubits,
+                seed[b].fidelity_score, seed[b].connectivity_type);
     return 0;
 }
 
