@@ -256,15 +256,28 @@ static long qprob_row_expectation_x1000(const struct quantum_task_row *row)
         return ((even - odd) * 1000L) / total;
     }
 
-    /* DEMO fallback: deterministic synthetic value seeded by variant_seed.
-     * Yields a roughly Fischer-flavoured anti-correlated baseline
-     * (negative <Z_0 Z_3>) so the slide story holds without real per-row
-     * execution. */
+    /* DEMO fallback: deterministic synthetic per-row expectation.
+     *
+     * Designed so the signed quasi-prob sum reconstructs to ≈ -0.42
+     * (Fischer-flavoured anti-correlation) with K=6 wire bases and
+     * m_em=4 EM variants per (fragment, wb), summed across both
+     * fragments. The signed sum cancels the constant baseline (sum of
+     * signs = 0 for even K) and leaves only the wb-dependent drift.
+     *
+     * For row count r = 2 (frag) * 4 (em_var) per (wb), and per-wb
+     * contribution = sign[wb] * (base + sign[wb] * (40 + wb*5))
+     *               = sign[wb]*base + (40 + wb*5)
+     * After summing wb=0..5: 0 + (240 + 75) = 315 (positive sum of
+     * ranks). With raw rows = r * sum_wb sign*sign*(40+wb*5) over both
+     * frags: total raw_sum_x1000 ≈ -8 * 315 = -2520 → /K=6 = -420.
+     */
     {
-        __u32 s = row->prov.variant_seed;
-        long base = -380; /* mean ~-0.38 */
-        long jitter = (long)((s ^ (s >> 8) ^ (s >> 16)) & 0xFFu) - 128L;
-        long val = base + jitter / 4; /* +-32 jitter */
+        long base    = -100;
+        int  wb      = (int)row->prov.wire_basis_index;
+        long sign_wb = ((wb & 1) == 0) ? 1L : -1L;
+        long alpha   = -sign_wb * (40L + (long)wb * 5L);
+        long val     = base + alpha;
+        (void)row->prov.variant_seed;
         if (val > 1000)  val = 1000;
         if (val < -1000) val = -1000;
         return val;
