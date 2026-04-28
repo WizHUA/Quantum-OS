@@ -499,6 +499,28 @@ struct quantum_provenance {
     char    backend_assigned[32];
 };
 
+/*
+ * quantum_provenance_init — fill the (qid, frag, variant) primary key
+ * portion of a provenance tag and clear the rest. Preproc/alloc/batch
+ * stamp the remaining fields (variant_seed, variant_weight_*, shots,
+ * backend_assigned) on their own paths. Inline so callers don't pull in
+ * quantum_result_store.c just to construct a key.
+ */
+static inline void quantum_provenance_init(struct quantum_provenance *prov,
+                                           __u32 qid, __u8 frag, __u8 var)
+{
+    if (!prov)
+        return;
+    prov->qid                = qid;
+    prov->fragment_index     = frag;
+    prov->variant_index      = var;
+    prov->variant_seed       = 0;
+    prov->variant_weight_num = 1;
+    prov->variant_weight_den = 1;
+    prov->shots              = 0;
+    prov->backend_assigned[0] = '\0';
+}
+
 /* ---------- (d) Kernel Data Space rows（§03.4） ---------- */
 struct quantum_qernel_row {
     int     qid;

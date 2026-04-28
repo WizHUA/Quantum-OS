@@ -786,3 +786,42 @@ int task_table_for_each_in_qernel(int qid,
     mutex_unlock(&g_store_mtx);
     return ret;
 }
+
+/*
+ * task_table_count_in_qernel — count rows under a qid, optionally split
+ * into total/done buckets. Used by postproc to drive the EM_COMBINING ->
+ * RECONSTRUCTING barrier and by debugfs to display per-qernel progress.
+ *
+ * Either out_total or out_done may be NULL.
+ *
+ * Returns 0 on success, -ENOENT when the qid has no live qernel row.
+ */
+int task_table_count_in_qernel(int qid, __u32 *out_total, __u32 *out_done)
+{
+    struct task_node *tn;
+    __u32 total = 0, done = 0;
+
+    if (qid <= 0 || qid > QUANTUM_MAX_QERNELS)
+        return -EINVAL;
+    mutex_lock(&g_store_mtx);
+    if (!g_qernel_table[qid].used) {
+        mutex_unlock(&g_store_mtx);
+        return -ENOENT;
+    }
+    list_for_each_entry(tn, &g_qernel_table[qid].tasks, link) {
+        total++;
+        switch (tn->row.state) {
+        case QVSTATE_DONE_VAR:
+        case QVSTATE_FAILED_VAR:
+        case QVSTATE_CANCELLED_VAR:
+            done++;
+            break;
+        default:
+            break;
+        }
+    }
+    mutex_unlock(&g_store_mtx);
+    if (out_total) *out_total = total;
+    if (out_done)  *out_done  = done;
+    return 0;
+}
