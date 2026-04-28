@@ -1,33 +1,153 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <linux/spinlock.h>
 
 #include "quantum_types.h"
 
-/*
- * quantum_batch_intake — SSOT §02.5 entry point.
+/* DEMO-PIVOT D-1: alloc-side ETA helpers (defined in quantum_alloc.c) */
+extern void quantum_alloc_eta_add(int backend_id, __u64 ns);
+
+/* ============================================================
+ * DEMO-PIVOT Step C: per-backend bundling pool (K=5 FIFO).
  *
- * Real implementation lands in M5 (per-backend pool with K_BUNDLE / timeout
- * driven binder). For PRE3 (B-1) we only need a working stub so alloc can
- * hand off without coupling against the eventual pool data structures.
+ * SSOT §02.5 prescribes a bundling pool that groups intake rows into
+ * clusters before they leave for sched. M5 will own the binder with
+ * adaptive K_BUNDLE / timeout; the demo collapses it to:
+ *   - one pool per backend, capacity K=5, FIFO, no sort
+ *   - on hitting K=5: emit a cluster commit log + write
+ *     dev_info.backend_eta_ns += cluster_estimated_ns (= total_shots * 1us)
  *
- * Contract once M5 lands:
- *   - O(1) push to per-backend intake_buf
- *   - returns 0 on accept, -ENOSPC when intake_buf is full
- *   - schedules pool_tick if K_BUNDLE reached
- */
+ * The legacy per-Qernel chain (interface->preproc->alloc->batch_run->
+ * sched_enqueue) still drives execution; the pool here is bookkeeping
+ * + ETA accounting that downstream alloc/sched rely on.
+ * ============================================================ */
+
+#define QBATCH_POOL_CAP 5
+
+struct qbatch_pool {
+    int     count;
+    int     total_shots;
+    __u32   first_qid;
+    __u8    first_frag;
+    __u8    first_var;
+};
+
+static struct qbatch_pool g_pool[QUANTUM_MAX_BACKENDS];
+static DEFINE_SPINLOCK(g_pool_lock);
+static int g_cluster_id;
+
+static void pool_reset(struct qbatch_pool *p)
+{
+    p->count = 0;
+    p->total_shots = 0;
+    p->first_qid = 0;
+    p->first_frag = 0;
+    p->first_var = 0;
+}
+
 int quantum_batch_intake(int backend_id,
                          const struct quantum_provenance *prov)
 {
+    unsigned long flags;
+    bool committed = false;
+    int  cluster_id = 0, cluster_shots = 0;
+    __u32 first_qid = 0;
+    __u8  first_frag = 0;
+    int   cur_count = 0;
+    __u64 add_ns = 0;
+
     if (!prov)
         return -EINVAL;
     if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
         return -EINVAL;
+
     pr_info("[batch]   intake backend=%d qid=%u frag=%u var=%u shots=%u\n",
             backend_id, prov->qid, prov->fragment_index,
             prov->variant_index, prov->shots);
+
+    spin_lock_irqsave(&g_pool_lock, flags);
+    {
+        struct qbatch_pool *p = &g_pool[backend_id];
+        if (p->count == 0) {
+            p->first_qid  = prov->qid;
+            p->first_frag = prov->fragment_index;
+            p->first_var  = prov->variant_index;
+        }
+        p->count       += 1;
+        p->total_shots += (int)prov->shots;
+        cur_count = p->count;
+        if (p->count >= QBATCH_POOL_CAP) {
+            g_cluster_id++;
+            cluster_id    = g_cluster_id;
+            cluster_shots = p->total_shots;
+            first_qid     = p->first_qid;
+            first_frag    = p->first_frag;
+            committed     = true;
+            pool_reset(p);
+        }
+    }
+    spin_unlock_irqrestore(&g_pool_lock, flags);
+
+    if (committed) {
+        add_ns = (__u64)cluster_shots * 1000ULL;
+        quantum_alloc_eta_add(backend_id, add_ns);
+        pr_info("[batch]   backend=%d pool size=%d/%d -> commit cluster_id=%d (head qid=%u/%u, total_shots=%d)\n",
+                backend_id, QBATCH_POOL_CAP, QBATCH_POOL_CAP,
+                cluster_id, first_qid, first_frag, cluster_shots);
+        pr_info("[batch]   dev_info update: aer%d eta+=%llu.%03llums (cluster_%d enqueued)\n",
+                backend_id, add_ns / 1000000ULL,
+                (add_ns / 1000ULL) % 1000ULL, cluster_id);
+    } else {
+        pr_info("[batch]   backend=%d pool size=%d/%d -> hold (waiting for K=%d)\n",
+                backend_id, cur_count, QBATCH_POOL_CAP, QBATCH_POOL_CAP);
+    }
     return 0;
 }
 EXPORT_SYMBOL_GPL(quantum_batch_intake);
+
+/*
+ * quantum_batch_flush_all — flush partial pools as residual clusters.
+ * Called by sched after the legacy task finishes so trailing rows
+ * don't sit in the pool forever in the demo (N×K×M typically not a
+ * multiple of K).
+ */
+int quantum_batch_flush_all(void)
+{
+    unsigned long flags;
+    int b;
+    int flushed = 0;
+
+    for (b = 0; b < QUANTUM_MAX_BACKENDS; b++) {
+        bool committed = false;
+        int  cluster_id = 0, cluster_shots = 0;
+        __u32 first_qid = 0;
+        __u64 add_ns;
+
+        spin_lock_irqsave(&g_pool_lock, flags);
+        if (g_pool[b].count > 0) {
+            g_cluster_id++;
+            cluster_id    = g_cluster_id;
+            cluster_shots = g_pool[b].total_shots;
+            first_qid     = g_pool[b].first_qid;
+            committed     = true;
+            pool_reset(&g_pool[b]);
+        }
+        spin_unlock_irqrestore(&g_pool_lock, flags);
+
+        if (committed) {
+            add_ns = (__u64)cluster_shots * 1000ULL;
+            quantum_alloc_eta_add(b, add_ns);
+            pr_info("[batch]   backend=%d flush -> commit cluster_id=%d (residual head qid=%u, total_shots=%d)\n",
+                    b, cluster_id, first_qid, cluster_shots);
+            pr_info("[batch]   dev_info update: aer%d eta+=%llu.%03llums (cluster_%d residual)\n",
+                    b, add_ns / 1000000ULL,
+                    (add_ns / 1000ULL) % 1000ULL, cluster_id);
+            flushed++;
+        }
+    }
+    return flushed;
+}
+EXPORT_SYMBOL_GPL(quantum_batch_flush_all);
 
 /* ============================================================
  * 内部：验证

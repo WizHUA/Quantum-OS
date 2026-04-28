@@ -19,6 +19,11 @@ void quantum_alloc_get_dev_info(struct quantum_dev_info *out);
 int  quantum_postproc_run(struct quantum_task_struct *task);
 int  qresult_store_put(struct quantum_task_struct *task);
 
+/* DEMO-PIVOT D-1: batch pool flush + alloc ETA helpers */
+int  quantum_batch_flush_all(void);
+void quantum_alloc_eta_sub(int backend_id, __u64 ns);
+__u64 quantum_alloc_eta_get(int backend_id);
+
 /* ============================================================
  * 全局状态
  * ============================================================ */
@@ -481,6 +486,34 @@ int quantum_sched_commit(struct quantum_commit_req *in)
 finalize:
     task->finish_time = ktime_get_ns();
     task->state       = QTASK_STATE_MERGING;
+
+    /*
+     * DEMO-PIVOT Step D: cluster done callback.
+     * Flush any partial pools so trailing rows commit, then subtract the
+     * actual cluster runtime from dev_info.backend_eta_ns. Demo uses the
+     * task's wallclock (finish - submit) as the actual_ns proxy.
+     */
+    {
+        int   bid = task->assigned_backend_id;
+        __u64 actual_ns = (task->finish_time > task->submit_time) ?
+                          (task->finish_time - task->submit_time) : 0;
+        int flushed = quantum_batch_flush_all();
+        (void)flushed;
+        if (bid >= 0 && bid < QUANTUM_MAX_BACKENDS) {
+            __u64 before = quantum_alloc_eta_get(bid);
+            quantum_alloc_eta_sub(bid, actual_ns);
+            pr_info("[sched]   cluster done qid=%d backend=%d actual=%llu.%03llums (eta %llu.%03llu -> %llu.%03llu ms)\n",
+                    task->qid, bid,
+                    actual_ns / 1000000ULL,
+                    (actual_ns / 1000ULL) % 1000ULL,
+                    before / 1000000ULL,
+                    (before / 1000ULL) % 1000ULL,
+                    quantum_alloc_eta_get(bid) / 1000000ULL,
+                    (quantum_alloc_eta_get(bid) / 1000ULL) % 1000ULL);
+        }
+        pr_info("[sched]   qid=%d backend=%d dispatch+commit complete, %d outcomes\n",
+                task->qid, bid, task->result.num_outcomes);
+    }
 
     /*
      * task 已在 sched_dispatch_loop 里 list_del_init，
