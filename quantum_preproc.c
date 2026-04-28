@@ -7,6 +7,15 @@
 /* 前向声明：依赖alloc提供DevInfo快照 */
 void quantum_alloc_get_dev_info(struct quantum_dev_info *out);
 
+/* 前向声明：result_store APIs（M3：Manifest + (frag,var) emission） */
+void quantum_result_store_lock(void);
+void quantum_result_store_unlock(void);
+struct quantum_qernel_row *qernel_table_get_locked(int qid);
+int  qernel_table_set_state(int qid, int new_state);
+int  task_table_insert(int qid, const struct quantum_task_row *row);
+
+static int preproc_emit_manifest(struct quantum_task_struct *task);
+
 /* ============================================================
  * 内部：线路静态分析
  * ============================================================ */
@@ -465,6 +474,236 @@ int quantum_preproc_run(struct quantum_task_struct *task)
         task->error_mitigation = QMIT_NONE;
     }
 
+    /* 阶段5 (M3, SSOT §02.3)：Manifest + (frag, variant) emission */
+    ret = preproc_emit_manifest(task);
+    if (ret < 0) {
+        pr_warn("quantum_preproc: qid=%d manifest emission failed: %d\n",
+                task->qid, ret);
+        task->error_code = QERR_SPLIT_FAIL;
+        kfree(devinfo_snap);
+        return ret;
+    }
+
     kfree(devinfo_snap);
     return 0;
+}
+
+/* ============================================================
+ * M3 (SSOT §02.3): Manifest + (fragment, variant) emission
+ *
+ * Reads the legacy task hints (split_strategy → cut_kind, error_mitigation
+ * → em_kind, num_qubits, circuit_depth) and emits:
+ *   1. quantum_manifest written into qernel_row.manifest
+ *   2. N×M task_table rows in QVSTATE_PREPARED (one per (frag, variant))
+ *   3. qernel_row state advanced RECEIVED → PREPARED
+ *
+ * When the qid has no qernel_row (legacy write() path that bypasses
+ * QIOC_SUBMIT) the function logs the parsed/manifest summary and returns
+ * 0 without inserting rows; the legacy submit chain continues unchanged.
+ * ============================================================ */
+
+static const char *cut_kind_name(int k)
+{
+    switch (k) {
+    case QCUT_NONE: return "NONE";
+    case QCUT_WIRE: return "WIRE";
+    case QCUT_GATE: return "GATE";
+    case QCUT_AUTO: return "AUTO";
+    default:        return "?";
+    }
+}
+
+static const char *em_kind_name(int k)
+{
+    switch (k) {
+    case QEM_NONE:    return "NONE";
+    case QEM_READOUT: return "READOUT";
+    case QEM_ZNE:     return "ZNE";
+    case QEM_PEC:     return "PEC";
+    default:          return "?";
+    }
+}
+
+static int preproc_emit_manifest(struct quantum_task_struct *task)
+{
+    struct quantum_manifest   *mfst = NULL;
+    struct quantum_task_row   *row  = NULL;
+    struct quantum_qernel_row *qrow;
+    int cut_kind, em_kind, recon_rule;
+    int num_frags, frag_qubits, m_per_frag;
+    int f, v, i, ret = 0;
+    int rows_emitted = 0;
+    bool have_qernel = false;
+
+    /* Map legacy hints → ABI v3 enums.
+     *
+     * cut_kind: prefer qernel_row.cut_hint (stamped by QIOC_SUBMIT before
+     * submit_chain_run); fall back to task->split_strategy for the legacy
+     * write() path (where qernel_row.cut_hint is 0). task->split_strategy
+     * is reset to NONE by quantum_preproc_run's no-split branch, so reading
+     * it after the fact only works when the user passed a non-zero hint
+     * AND num_qubits exceeded the per-QPU cap (need_split path).
+     */
+    cut_kind = QCUT_NONE;
+    quantum_result_store_lock();
+    {
+        struct quantum_qernel_row *qrow_peek =
+            qernel_table_get_locked(task->qid);
+        if (qrow_peek && qrow_peek->cut_hint > 0)
+            cut_kind = qrow_peek->cut_hint;
+    }
+    quantum_result_store_unlock();
+    if (cut_kind == QCUT_NONE && task->split_strategy != QSPLIT_STRATEGY_NONE)
+        cut_kind = QCUT_WIRE;
+
+    switch (task->error_mitigation) {
+    case QMIT_MEM:  em_kind = QEM_READOUT; break;
+    case QMIT_CDR:  em_kind = QEM_ZNE;     break;
+    case QMIT_PEC:  em_kind = QEM_PEC;     break;
+    default:        em_kind = QEM_NONE;    break;
+    }
+
+    /* Decide N (fragments) and per-fragment qubit_count */
+    if (cut_kind == QCUT_WIRE) {
+        num_frags  = 2;                /* acceptance scope: bisection */
+        if (num_frags > QUANTUM_MAX_FRAGMENTS)
+            num_frags = QUANTUM_MAX_FRAGMENTS;
+        frag_qubits = (task->num_qubits + num_frags - 1) / num_frags;
+        recon_rule  = QRECON_TENSOR;
+    } else {
+        num_frags   = 1;
+        frag_qubits = task->num_qubits;
+        recon_rule  = QRECON_DIRECT;
+    }
+    if (frag_qubits <= 0)  frag_qubits = 1;
+    if (frag_qubits > 255) frag_qubits = 255;
+
+    /* Decide M (variants per fragment) per H-3 / SSOT §02.3 */
+    switch (em_kind) {
+    case QEM_READOUT: m_per_frag = 2 * frag_qubits; break;
+    case QEM_ZNE:     m_per_frag = 3;               break;  /* stub */
+    case QEM_PEC:     m_per_frag = 1;               break;  /* stub */
+    default:          m_per_frag = 1;               break;
+    }
+    if (m_per_frag < 1)
+        m_per_frag = 1;
+    if (m_per_frag > QUANTUM_MAX_VARIANTS)
+        m_per_frag = QUANTUM_MAX_VARIANTS;
+
+    /* Heap-alloc large structs (manifest ~3KB, task_row ~2KB) */
+    mfst = kzalloc(sizeof(*mfst), GFP_KERNEL);
+    row  = kzalloc(sizeof(*row),  GFP_KERNEL);
+    if (!mfst || !row) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    mfst->abi_version      = QUANTUM_ABI_VERSION;
+    mfst->cut_kind         = (__u8)cut_kind;
+    mfst->em_kind          = (__u8)em_kind;
+    mfst->num_fragments    = (__u8)num_frags;
+    mfst->reconstruct_rule = (__u8)recon_rule;
+    for (f = 0; f < num_frags; f++) {
+        mfst->fragment[f].num_variants    = (__u8)m_per_frag;
+        mfst->fragment[f].qubit_count     = (__u8)frag_qubits;
+        mfst->fragment[f].classical_count = (__u8)frag_qubits;
+        mfst->fragment[f].depth_estimate  = (__u16)task->circuit_depth;
+        for (v = 0; v < m_per_frag; v++) {
+            mfst->fragment[f].weight_num[v] = 1;
+            mfst->fragment[f].weight_den[v] = 1;
+        }
+    }
+
+    /* Stamp manifest into qernel_row under the result_store mutex */
+    quantum_result_store_lock();
+    qrow = qernel_table_get_locked(task->qid);
+    if (qrow) {
+        memcpy(&qrow->manifest, mfst, sizeof(*mfst));
+        qrow->num_variants_total = (__u32)(num_frags * m_per_frag);
+        qrow->em_kind            = em_kind;
+        qrow->cut_hint           = cut_kind;
+        qrow->priority           = task->priority;
+        qrow->shots              = task->shots;
+        if (qrow->qasm[0] == '\0') {
+            strncpy(qrow->qasm, task->qir, QUANTUM_QIR_SIZE - 1);
+            qrow->qasm[QUANTUM_QIR_SIZE - 1] = '\0';
+        }
+        if (qrow->submit_ns == 0)
+            qrow->submit_ns = task->submit_time;
+        have_qernel = true;
+    }
+    quantum_result_store_unlock();
+
+    pr_info("[preproc] qid=%d parsed nq=%d depth=%d gates=%d\n",
+            task->qid, task->num_qubits,
+            task->circuit_depth, task->gate_count);
+    pr_info("[preproc] qid=%d manifest cut=%s em=%s frags=%d variants_total=%d\n",
+            task->qid, cut_kind_name(cut_kind), em_kind_name(em_kind),
+            num_frags, num_frags * m_per_frag);
+
+    if (!have_qernel) {
+        /* legacy write() path — no qernel_row, skip task_table emission;
+         * legacy chain (alloc/batch/sched) carries on with task struct. */
+        pr_info("[preproc] qid=%d skip emission (no qernel_row, legacy path)\n",
+                task->qid);
+        goto out;
+    }
+
+    /* Emit one task_table row per (fragment, variant) */
+    for (f = 0; f < num_frags; f++) {
+        for (v = 0; v < m_per_frag; v++) {
+            memset(row, 0, sizeof(*row));
+            quantum_provenance_init(&row->prov, (__u32)task->qid,
+                                    (__u8)f, (__u8)v);
+            row->prov.shots              = task->shots;
+            row->prov.variant_weight_num = 1;
+            row->prov.variant_weight_den = 1;
+
+            /* SSOT §02.3 + H-3: variant_seed for readout EM */
+            if (em_kind == QEM_READOUT) {
+                int qi    = v / 2;     /* qubit index inside fragment */
+                int basis = v & 1;     /* 0 = prepare |0>, 1 = prepare |1>+X */
+                row->prov.variant_seed =
+                    0xCA110000U | (__u32)qi | ((__u32)basis << 8);
+            } else {
+                row->prov.variant_seed = 0;
+            }
+
+            row->state               = QVSTATE_PREPARED;
+            row->assigned_backend_id = -1;
+            row->bundle_id           = -1;
+            for (i = 0; i < QUANTUM_MAX_QUBITS; i++)
+                row->phys_qubits[i] = -1;
+
+            /* Acceptance scope: copy original QASM into every row; M5 binder
+             * will refine per-fragment QASM. */
+            strncpy(row->qasm, task->qir, QUANTUM_SUB_QIR_SIZE - 1);
+            row->qasm[QUANTUM_SUB_QIR_SIZE - 1] = '\0';
+
+            ret = task_table_insert(task->qid, row);
+            if (ret) {
+                pr_warn("[preproc] qid=%d insert frag=%d var=%d err=%d\n",
+                        task->qid, f, v, ret);
+                goto out;
+            }
+            rows_emitted++;
+        }
+    }
+
+    pr_info("[preproc] qid=%d emitted task_table rows=%d\n",
+            task->qid, rows_emitted);
+
+    /* RECEIVED → PREPARED on the qernel row */
+    ret = qernel_table_set_state(task->qid, QSTATE_PREPARED);
+    if (ret) {
+        pr_warn("[preproc] qid=%d set_state PREPARED err=%d\n",
+                task->qid, ret);
+        /* keep ret; caller will mark task FAILED */
+        goto out;
+    }
+
+out:
+    kfree(mfst);
+    kfree(row);
+    return ret;
 }

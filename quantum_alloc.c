@@ -12,6 +12,17 @@
 int quantum_batch_intake(int backend_id,
                          const struct quantum_provenance *prov);
 
+/* Forward decls from quantum_result_store.c — used by M3 per-row walk
+ * (REVIEW-PRE O-2). */
+int task_table_for_each_in_qernel(int qid,
+                                  int (*cb)(struct quantum_task_row *,
+                                            void *),
+                                  void *arg);
+int task_table_set_backend(const struct quantum_provenance *prov,
+                           int backend_id);
+int task_table_set_state(const struct quantum_provenance *prov,
+                         int new_state);
+
 /* ============================================================
  * 全局状态
  * ============================================================ */
@@ -65,6 +76,7 @@ static int alloc_first_fit(int need_qubits,
             b->total_qubits >= need_qubits) {
             *out_backend = i;
             *out_start   = 0;
+            /* TODO(M5): release reservation on terminal states (REVIEW-PRE O-1) */
             b->num_qubits_available -= need_qubits; /* reserve count only */
             spin_unlock_irqrestore(&g_alloc_lock, flags);
             return 0;
@@ -297,6 +309,122 @@ void quantum_alloc_exit(void)
  * need_split=0：执行分配，填写 task->assigned_backend_id/phys_qubits[]/fidelity_score
  * need_split=1：跳过，子线路在sched dispatch时由quantum_alloc_find_idle单独分配
  */
+
+/* ============================================================
+ * M3 (SSOT §02.4 / REVIEW-PRE O-2): per-row walk
+ *
+ * preproc emits N×M task_table rows in QVSTATE_PREPARED. alloc walks them
+ * here, picks one backend per fragment (variants of the same fragment share
+ * the same backend, per SSOT §02.4), advances each row PREPARED -> ASSIGNED,
+ * and hands every variant to batch.intake with REAL (qid, frag, var)
+ * provenance.
+ * ============================================================ */
+
+struct alloc_plan {
+    struct quantum_provenance prov;
+    int backend_id;
+    int fidelity;
+};
+
+struct alloc_walk_ctx {
+    struct alloc_plan *plans;
+    int n_plans;
+    int capacity;
+    int num_backends;
+};
+
+static int alloc_walk_cb(struct quantum_task_row *row, void *arg)
+{
+    struct alloc_walk_ctx *c = arg;
+    int b;
+
+    if (row->state != QVSTATE_PREPARED)
+        return 0;
+    if (c->n_plans >= c->capacity)
+        return -ENOSPC;
+    if (c->num_backends <= 0)
+        return -ENODEV;
+
+    b = row->prov.fragment_index % c->num_backends;
+    c->plans[c->n_plans].prov       = row->prov;
+    c->plans[c->n_plans].backend_id = b;
+    c->plans[c->n_plans].fidelity   = g_backend_pool.backends[b].fidelity_score;
+    c->n_plans++;
+    return 0;
+}
+
+/*
+ * alloc_run_per_row — Returns: rows handed off (>=0) on success;
+ *                              0 when no task_table rows exist (legacy
+ *                              write() path falls back to single-shot);
+ *                              <0 errno on fatal error.
+ *
+ * Note: callbacks under task_table_for_each_in_qernel run with the
+ * result_store mutex held, so the cb only snapshots; the actual mutating
+ * calls (set_backend / set_state / batch_intake) happen after the walk
+ * returns to avoid recursive locking.
+ */
+static int alloc_run_per_row(struct quantum_task_struct *task)
+{
+    struct alloc_walk_ctx ctx;
+    int ret, i;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.num_backends = g_backend_pool.num_backends;
+    if (ctx.num_backends <= 0)
+        return 0;
+    ctx.capacity = QUANTUM_MAX_FRAGMENTS * QUANTUM_MAX_VARIANTS;
+    ctx.plans = kzalloc(sizeof(*ctx.plans) * ctx.capacity, GFP_KERNEL);
+    if (!ctx.plans)
+        return -ENOMEM;
+
+    ret = task_table_for_each_in_qernel(task->qid, alloc_walk_cb, &ctx);
+    if (ret == -ENOENT) {
+        /* legacy write() path: no qernel_row backing this qid */
+        kfree(ctx.plans);
+        return 0;
+    }
+    if (ret < 0 && ret != -ENOSPC) {
+        pr_warn("[alloc] qid=%d for_each err=%d\n", task->qid, ret);
+        kfree(ctx.plans);
+        return ret;
+    }
+    if (ctx.n_plans == 0) {
+        kfree(ctx.plans);
+        return 0;
+    }
+
+    for (i = 0; i < ctx.n_plans; i++) {
+        struct alloc_plan *p = &ctx.plans[i];
+        int sret;
+
+        sret = task_table_set_backend(&p->prov, p->backend_id);
+        if (sret) {
+            pr_warn("[alloc] qid=%u frag=%u var=%u set_backend err=%d\n",
+                    p->prov.qid, p->prov.fragment_index,
+                    p->prov.variant_index, sret);
+            continue;
+        }
+        sret = task_table_set_state(&p->prov, QVSTATE_ASSIGNED);
+        if (sret) {
+            pr_warn("[alloc] qid=%u frag=%u var=%u set_state err=%d\n",
+                    p->prov.qid, p->prov.fragment_index,
+                    p->prov.variant_index, sret);
+            continue;
+        }
+
+        pr_info("[alloc]   qid=%u frag=%u var=%u -> backend=%d fidelity=%d\n",
+                p->prov.qid, p->prov.fragment_index,
+                p->prov.variant_index, p->backend_id, p->fidelity);
+
+        (void)quantum_batch_intake(p->backend_id, &p->prov);
+    }
+
+    ret = ctx.n_plans;
+    kfree(ctx.plans);
+    return ret;
+}
+
 int quantum_alloc_run(struct quantum_task_struct *task)
 {
     /* 修复：devinfo_snap 从栈改为堆分配 */
@@ -356,14 +484,24 @@ int quantum_alloc_run(struct quantum_task_struct *task)
                                               devinfo_snap);
 
     {
-        struct quantum_provenance prov;
-        quantum_provenance_init(&prov, (__u32)task->qid, 0, 0);
-        prov.shots = task->shots;
-        (void)quantum_batch_intake(out_backend, &prov);
-    }
+        int per_row = alloc_run_per_row(task);
 
-    pr_info("[alloc] qid=%d frag=0 -> backend=%d fidelity=%d (phys deferred to batch)\n",
-            task->qid, out_backend, task->fidelity_score);
+        if (per_row > 0) {
+            /* M3 path: per-(frag,var) intake completed; suppress legacy
+             * single-shot summary line. */
+        } else {
+            /* legacy write() path (no qernel_row, no task_table rows):
+             * preserve the pre-M3 single-shot wiring so smoke tests still
+             * see one [batch] intake line per submission. */
+            struct quantum_provenance prov;
+            quantum_provenance_init(&prov, (__u32)task->qid, 0, 0);
+            prov.shots = task->shots;
+            (void)quantum_batch_intake(out_backend, &prov);
+
+            pr_info("[alloc] qid=%d frag=0 -> backend=%d fidelity=%d (phys deferred to batch)\n",
+                    task->qid, out_backend, task->fidelity_score);
+        }
+    }
 
     kfree(devinfo_snap);
     return 0;

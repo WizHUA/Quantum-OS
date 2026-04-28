@@ -45,6 +45,9 @@ int  qernel_table_set_state(int qid, int new_state);
 int  qernel_table_set_cancel(int qid);
 int  qernel_table_wait_terminal(int qid, long timeout_jiffies);
 void qernel_table_release(int qid);
+void quantum_result_store_lock(void);
+void quantum_result_store_unlock(void);
+struct quantum_qernel_row *qernel_table_get_locked(int qid);
 
 /* Map ABI v3 QSTATE_* to legacy QTASK_STATE_* for userspace continuity. */
 static int qstate_to_legacy(int s)
@@ -644,6 +647,20 @@ static long quantum_ioctl(struct file *filp,
         if (qid_pre < 0) {
             kfree(sreq);
             return qid_pre;
+        }
+
+        /* Stash user cut_hint into the qernel_row so preproc can recover
+         * the original intent (task->split_strategy gets reset for small
+         * circuits in quantum_preproc_run's no-split branch). */
+        {
+            struct quantum_qernel_row *qrow;
+            quantum_result_store_lock();
+            qrow = qernel_table_get_locked(qid_pre);
+            if (qrow) {
+                qrow->cut_hint = sreq->cut_hint;
+                qrow->em_kind  = sreq->error_mitigation;
+            }
+            quantum_result_store_unlock();
         }
 
         /* Strip optional first-line config header (legacy compatibility):

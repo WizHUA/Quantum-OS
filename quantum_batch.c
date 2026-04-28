@@ -22,7 +22,7 @@ int quantum_batch_intake(int backend_id,
         return -EINVAL;
     if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
         return -EINVAL;
-    pr_info("[batch] intake stub backend=%d qid=%u frag=%u var=%u shots=%u\n",
+    pr_info("[batch]   intake backend=%d qid=%u frag=%u var=%u shots=%u\n",
             backend_id, prov->qid, prov->fragment_index,
             prov->variant_index, prov->shots);
     return 0;
