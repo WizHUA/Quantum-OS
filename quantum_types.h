@@ -19,7 +19,8 @@
 #define QUANTUM_MAX_BACKENDS        8
 #define QUANTUM_MAX_SUB_CIRCUITS    8
 #define QUANTUM_MAX_FRAGMENTS       QUANTUM_MAX_SUB_CIRCUITS /* alias per restart spec */
-#define QUANTUM_MAX_VARIANTS        16  /* per fragment, EM expansion */
+#define QUANTUM_MAX_VARIANTS        32  /* per fragment, EM x wire-basis expansion (demo: 4 em x 6 basis = 24) */
+#define QUANTUM_DEMO_WIRE_BASIS_MAX 8   /* CutQC standard 8-basis cap; demo uses 6 */
 #define QUANTUM_SUB_QIR_SIZE        2048
 #define QUANTUM_MAX_TOTAL_QUBITS    (QUANTUM_MAX_QUBITS * QUANTUM_MAX_BACKENDS)
 #define QUANTUM_MAX_NEIGHBORS       8
@@ -238,6 +239,10 @@ struct quantum_dev_info {
     struct quantum_qubit_info   qubits[QUANTUM_MAX_TOTAL_QUBITS];
     __u64                       last_calibration_time;
     int                         calib_in_progress;
+    /* DEMO-PIVOT D-1: per-backend ETA in nanoseconds, written by batch on
+     * cluster commit, decremented by sched on cluster done. alloc reads
+     * a snapshot to pick the lowest-eta backend that still fits. */
+    __u64                       backend_eta_ns[QUANTUM_MAX_BACKENDS];
 };
 
 /*
@@ -455,6 +460,9 @@ struct quantum_manifest {
         __u8    qubit_count;
         __u8    classical_count;
         __u16   depth_estimate;
+        /* DEMO-PIVOT D-2: K wire-basis preparations per fragment (CutQC) */
+        __u8    num_wire_basis;
+        __u8    _pad_d2[3];
     } fragment[QUANTUM_MAX_FRAGMENTS];
 };
 
@@ -492,6 +500,11 @@ struct quantum_provenance {
     __u32   qid;
     __u8    fragment_index;
     __u8    variant_index;
+    /* DEMO-PIVOT D-2: which CutQC wire-basis preparation this row carries
+     * (0..num_wire_basis-1). Encoded redundantly with variant_index for
+     * postproc convenience: variant_index = wire_basis_index * M_em + em_idx. */
+    __u8    wire_basis_index;
+    __u8    _pad_d2;
     __u32   variant_seed;
     __s32   variant_weight_num;
     __u32   variant_weight_den;
@@ -514,6 +527,7 @@ static inline void quantum_provenance_init(struct quantum_provenance *prov,
     prov->qid                = qid;
     prov->fragment_index     = frag;
     prov->variant_index      = var;
+    prov->wire_basis_index   = 0;
     prov->variant_seed       = 0;
     prov->variant_weight_num = 1;
     prov->variant_weight_den = 1;

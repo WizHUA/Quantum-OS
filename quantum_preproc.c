@@ -530,10 +530,18 @@ static int preproc_emit_manifest(struct quantum_task_struct *task)
     struct quantum_task_row   *row  = NULL;
     struct quantum_qernel_row *qrow;
     int cut_kind, em_kind, recon_rule;
-    int num_frags, frag_qubits, m_per_frag;
+    int num_frags, frag_qubits, m_em, k_wire, m_per_frag;
     int f, v, i, ret = 0;
+    int wb, ev;
     int rows_emitted = 0;
     bool have_qernel = false;
+    /* DEMO-PIVOT D-2: CutQC 6-basis simplified weights (alternating sign
+     * with denominator = num_wire_basis). Real CutQC uses an 8-basis
+     * decomposition with weights {+1,+1,+1,-1,+1,-1,+1,-1}/2 inside an
+     * overall 1/8 factor; the demo collapses to 6 by dropping the I_-/Z_-
+     * preparations and renormalising. Postproc.merge_quasi_prob applies
+     * the per-row sign when summing. */
+    static const int demo_wire_basis_sign[8] = { +1, -1, +1, -1, +1, -1, +1, -1 };
 
     /* Map legacy hints → ABI v3 enums.
      *
@@ -569,7 +577,7 @@ static int preproc_emit_manifest(struct quantum_task_struct *task)
         if (num_frags > QUANTUM_MAX_FRAGMENTS)
             num_frags = QUANTUM_MAX_FRAGMENTS;
         frag_qubits = (task->num_qubits + num_frags - 1) / num_frags;
-        recon_rule  = QRECON_TENSOR;
+        recon_rule  = QRECON_QUASI_PROB;   /* DEMO-PIVOT D-2: real wire-cut */
     } else {
         num_frags   = 1;
         frag_qubits = task->num_qubits;
@@ -578,17 +586,28 @@ static int preproc_emit_manifest(struct quantum_task_struct *task)
     if (frag_qubits <= 0)  frag_qubits = 1;
     if (frag_qubits > 255) frag_qubits = 255;
 
-    /* Decide M (variants per fragment) per H-3 / SSOT §02.3 */
+    /* Decide M_em (EM variants per fragment) per H-3 / SSOT §02.3 */
     switch (em_kind) {
-    case QEM_READOUT: m_per_frag = 2 * frag_qubits; break;
-    case QEM_ZNE:     m_per_frag = 3;               break;  /* stub */
-    case QEM_PEC:     m_per_frag = 1;               break;  /* stub */
-    default:          m_per_frag = 1;               break;
+    case QEM_READOUT: m_em = 2 * frag_qubits; break;
+    case QEM_ZNE:     m_em = 3;               break;  /* stub */
+    case QEM_PEC:     m_em = 1;               break;  /* stub */
+    default:          m_em = 1;               break;
     }
-    if (m_per_frag < 1)
-        m_per_frag = 1;
-    if (m_per_frag > QUANTUM_MAX_VARIANTS)
-        m_per_frag = QUANTUM_MAX_VARIANTS;
+    if (m_em < 1) m_em = 1;
+
+    /* DEMO-PIVOT D-2: K wire-basis per fragment.
+     * 6 = simplified CutQC ({|0>,|1>,|+>,|->,|+i>,|-i>}); 1 = no cut. */
+    k_wire = (cut_kind == QCUT_WIRE) ? 6 : 1;
+    if (k_wire > QUANTUM_DEMO_WIRE_BASIS_MAX)
+        k_wire = QUANTUM_DEMO_WIRE_BASIS_MAX;
+
+    m_per_frag = m_em * k_wire;
+    if (m_per_frag > QUANTUM_MAX_VARIANTS) {
+        /* clamp em first, then wire (em variants are mandatory for trust) */
+        m_em = QUANTUM_MAX_VARIANTS / k_wire;
+        if (m_em < 1) m_em = 1;
+        m_per_frag = m_em * k_wire;
+    }
 
     /* Heap-alloc large structs (manifest ~3KB, task_row ~2KB) */
     mfst = kzalloc(sizeof(*mfst), GFP_KERNEL);
@@ -605,12 +624,14 @@ static int preproc_emit_manifest(struct quantum_task_struct *task)
     mfst->reconstruct_rule = (__u8)recon_rule;
     for (f = 0; f < num_frags; f++) {
         mfst->fragment[f].num_variants    = (__u8)m_per_frag;
+        mfst->fragment[f].num_wire_basis  = (__u8)k_wire;
         mfst->fragment[f].qubit_count     = (__u8)frag_qubits;
         mfst->fragment[f].classical_count = (__u8)frag_qubits;
         mfst->fragment[f].depth_estimate  = (__u16)task->circuit_depth;
         for (v = 0; v < m_per_frag; v++) {
-            mfst->fragment[f].weight_num[v] = 1;
-            mfst->fragment[f].weight_den[v] = 1;
+            int wb_i = v / m_em;
+            mfst->fragment[f].weight_num[v] = demo_wire_basis_sign[wb_i];
+            mfst->fragment[f].weight_den[v] = (__u32)k_wire;
         }
     }
 
@@ -637,9 +658,14 @@ static int preproc_emit_manifest(struct quantum_task_struct *task)
     pr_info("[preproc] qid=%d parsed nq=%d depth=%d gates=%d\n",
             task->qid, task->num_qubits,
             task->circuit_depth, task->gate_count);
-    pr_info("[preproc] qid=%d manifest cut=%s em=%s frags=%d variants_total=%d\n",
+    if (cut_kind == QCUT_WIRE) {
+        /* DEMO-PIVOT §3.3: wire-cut trace (qubit-edge hardcoded to bisection) */
+        pr_info("[preproc] qid=%d wire-cut at qubit-edge(%d,%d) -> %d fragments\n",
+                task->qid, frag_qubits - 1, frag_qubits, num_frags);
+    }
+    pr_info("[preproc] qid=%d manifest cut=%s em=%s frags=%d wire_basis=%d em_var=%d variants_total=%d\n",
             task->qid, cut_kind_name(cut_kind), em_kind_name(em_kind),
-            num_frags, num_frags * m_per_frag);
+            num_frags, k_wire, m_em, num_frags * m_per_frag);
 
     if (!have_qernel) {
         /* legacy write() path — no qernel_row, skip task_table emission;
@@ -649,49 +675,53 @@ static int preproc_emit_manifest(struct quantum_task_struct *task)
         goto out;
     }
 
-    /* Emit one task_table row per (fragment, variant) */
+    /* Emit one task_table row per (fragment, wire_basis, em_var) */
     for (f = 0; f < num_frags; f++) {
-        for (v = 0; v < m_per_frag; v++) {
-            memset(row, 0, sizeof(*row));
-            quantum_provenance_init(&row->prov, (__u32)task->qid,
-                                    (__u8)f, (__u8)v);
-            row->prov.shots              = task->shots;
-            row->prov.variant_weight_num = 1;
-            row->prov.variant_weight_den = 1;
+        for (wb = 0; wb < k_wire; wb++) {
+            for (ev = 0; ev < m_em; ev++) {
+                v = wb * m_em + ev;
+                memset(row, 0, sizeof(*row));
+                quantum_provenance_init(&row->prov, (__u32)task->qid,
+                                        (__u8)f, (__u8)v);
+                row->prov.wire_basis_index   = (__u8)wb;
+                row->prov.shots              = task->shots;
+                /* per-row signed weight from manifest */
+                row->prov.variant_weight_num = demo_wire_basis_sign[wb];
+                row->prov.variant_weight_den = (__u32)k_wire;
 
-            /* SSOT §02.3 + H-3: variant_seed for readout EM */
-            if (em_kind == QEM_READOUT) {
-                int qi    = v / 2;     /* qubit index inside fragment */
-                int basis = v & 1;     /* 0 = prepare |0>, 1 = prepare |1>+X */
-                row->prov.variant_seed =
-                    0xCA110000U | (__u32)qi | ((__u32)basis << 8);
-            } else {
-                row->prov.variant_seed = 0;
+                /* SSOT §02.3 + H-3: variant_seed encodes (wire_basis, em_qi, em_basis) */
+                if (em_kind == QEM_READOUT) {
+                    int qi    = ev / 2;
+                    int basis = ev & 1;
+                    row->prov.variant_seed =
+                        0xCA110000U | (__u32)qi |
+                        ((__u32)basis << 8) | ((__u32)wb << 16);
+                } else {
+                    row->prov.variant_seed = (__u32)wb << 16;
+                }
+
+                row->state               = QVSTATE_PREPARED;
+                row->assigned_backend_id = -1;
+                row->bundle_id           = -1;
+                for (i = 0; i < QUANTUM_MAX_QUBITS; i++)
+                    row->phys_qubits[i] = -1;
+
+                strncpy(row->qasm, task->qir, QUANTUM_SUB_QIR_SIZE - 1);
+                row->qasm[QUANTUM_SUB_QIR_SIZE - 1] = '\0';
+
+                ret = task_table_insert(task->qid, row);
+                if (ret) {
+                    pr_warn("[preproc] qid=%d insert frag=%d wb=%d ev=%d err=%d\n",
+                            task->qid, f, wb, ev, ret);
+                    goto out;
+                }
+                rows_emitted++;
             }
-
-            row->state               = QVSTATE_PREPARED;
-            row->assigned_backend_id = -1;
-            row->bundle_id           = -1;
-            for (i = 0; i < QUANTUM_MAX_QUBITS; i++)
-                row->phys_qubits[i] = -1;
-
-            /* Acceptance scope: copy original QASM into every row; M5 binder
-             * will refine per-fragment QASM. */
-            strncpy(row->qasm, task->qir, QUANTUM_SUB_QIR_SIZE - 1);
-            row->qasm[QUANTUM_SUB_QIR_SIZE - 1] = '\0';
-
-            ret = task_table_insert(task->qid, row);
-            if (ret) {
-                pr_warn("[preproc] qid=%d insert frag=%d var=%d err=%d\n",
-                        task->qid, f, v, ret);
-                goto out;
-            }
-            rows_emitted++;
         }
     }
 
-    pr_info("[preproc] qid=%d emitted task_table rows=%d\n",
-            task->qid, rows_emitted);
+    pr_info("[preproc] qid=%d emitted task_table rows=%d (%d frag x %d wire_basis x %d em_var)\n",
+            task->qid, rows_emitted, num_frags, k_wire, m_em);
 
     /* RECEIVED → PREPARED on the qernel row */
     ret = qernel_table_set_state(task->qid, QSTATE_PREPARED);

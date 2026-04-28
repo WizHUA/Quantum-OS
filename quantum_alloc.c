@@ -23,6 +23,12 @@ int task_table_set_backend(const struct quantum_provenance *prov,
 int task_table_set_state(const struct quantum_provenance *prov,
                          int new_state);
 
+/* Forward decls from quantum_result_store.c (DEMO-PIVOT D-1: read manifest
+ * to decide per-fragment qubit count for backend selection). */
+struct quantum_qernel_row *qernel_table_get_locked(int qid);
+void quantum_result_store_lock(void);
+void quantum_result_store_unlock(void);
+
 /* ============================================================
  * 全局状态
  * ============================================================ */
@@ -324,6 +330,7 @@ struct alloc_plan {
     struct quantum_provenance prov;
     int backend_id;
     int fidelity;
+    __u8 frag_qubits;
 };
 
 struct alloc_walk_ctx {
@@ -331,12 +338,46 @@ struct alloc_walk_ctx {
     int n_plans;
     int capacity;
     int num_backends;
+    /* DEMO-PIVOT D-1: per-backend ETA snapshot at start, mutated as we plan */
+    __u64 eta_ns[QUANTUM_MAX_BACKENDS];
+    /* per-fragment qubit count from manifest (cached during walk) */
+    __u8  frag_qubits[QUANTUM_MAX_FRAGMENTS];
+    __u8  has_frag_qubits;
 };
+
+/* DEMO-PIVOT D-1: pick the backend with lowest eta_ns among those that
+ * can fit need_qubits. Falls back to fragment_index % num_backends when
+ * all are oversubscribed. Updates eta_ns in place with a 1us/shot estimate
+ * so subsequent rows see the load this row will impose. */
+static int alloc_demo_pick_backend(struct alloc_walk_ctx *c,
+                                   int need_qubits, __u32 shots)
+{
+    int i, best = -1;
+    __u64 best_eta = (__u64)-1;
+    __u64 add_ns;
+
+    for (i = 0; i < c->num_backends; i++) {
+        struct quantum_backend *bk = &g_backend_pool.backends[i];
+        if (need_qubits > bk->total_qubits)
+            continue;
+        if (c->eta_ns[i] < best_eta) {
+            best_eta = c->eta_ns[i];
+            best = i;
+        }
+    }
+    if (best < 0)
+        best = 0;
+    /* per-row provisional load: shots * 1us (sched will reconcile) */
+    add_ns = (__u64)shots * 1000ULL;
+    c->eta_ns[best] += add_ns;
+    return best;
+}
 
 static int alloc_walk_cb(struct quantum_task_row *row, void *arg)
 {
     struct alloc_walk_ctx *c = arg;
     int b;
+    int need_q;
 
     if (row->state != QVSTATE_PREPARED)
         return 0;
@@ -345,10 +386,16 @@ static int alloc_walk_cb(struct quantum_task_row *row, void *arg)
     if (c->num_backends <= 0)
         return -ENODEV;
 
-    b = row->prov.fragment_index % c->num_backends;
-    c->plans[c->n_plans].prov       = row->prov;
-    c->plans[c->n_plans].backend_id = b;
-    c->plans[c->n_plans].fidelity   = g_backend_pool.backends[b].fidelity_score;
+    /* per-fragment qubit count: from manifest if available, else 1 */
+    need_q = c->has_frag_qubits ?
+             c->frag_qubits[row->prov.fragment_index] : 1;
+    if (need_q < 1) need_q = 1;
+
+    b = alloc_demo_pick_backend(c, need_q, row->prov.shots);
+    c->plans[c->n_plans].prov        = row->prov;
+    c->plans[c->n_plans].backend_id  = b;
+    c->plans[c->n_plans].fidelity    = g_backend_pool.backends[b].fidelity_score;
+    c->plans[c->n_plans].frag_qubits = (__u8)need_q;
     c->n_plans++;
     return 0;
 }
@@ -377,6 +424,40 @@ static int alloc_run_per_row(struct quantum_task_struct *task)
     ctx.plans = kzalloc(sizeof(*ctx.plans) * ctx.capacity, GFP_KERNEL);
     if (!ctx.plans)
         return -ENOMEM;
+
+    /* DEMO-PIVOT D-1 + D-2: snapshot dev_info.backend_eta_ns and the
+     * per-fragment qubit_count from the qernel manifest under the result
+     * store mutex; everything else (set_backend / set_state / batch_intake)
+     * runs after the walk to avoid recursive locking. */
+    quantum_result_store_lock();
+    {
+        struct quantum_qernel_row *qrow = qernel_table_get_locked(task->qid);
+        if (qrow) {
+            int f;
+            for (f = 0; f < qrow->manifest.num_fragments &&
+                        f < QUANTUM_MAX_FRAGMENTS; f++) {
+                ctx.frag_qubits[f] = qrow->manifest.fragment[f].qubit_count;
+            }
+            ctx.has_frag_qubits = 1;
+        }
+    }
+    quantum_result_store_unlock();
+    {
+        unsigned long flags;
+        spin_lock_irqsave(&g_alloc_lock, flags);
+        for (i = 0; i < ctx.num_backends; i++)
+            ctx.eta_ns[i] = g_dev_info.backend_eta_ns[i];
+        spin_unlock_irqrestore(&g_alloc_lock, flags);
+    }
+
+    /* DEMO-PIVOT §3.3: alloc dev_info snapshot (one line per snapshot) */
+    if (ctx.num_backends >= 2) {
+        pr_info("[alloc]   dev_info snapshot: aer0 eta=%llu.%03llums aer1 eta=%llu.%03llums\n",
+                ctx.eta_ns[0] / 1000000ULL,
+                (ctx.eta_ns[0] / 1000ULL) % 1000ULL,
+                ctx.eta_ns[1] / 1000000ULL,
+                (ctx.eta_ns[1] / 1000ULL) % 1000ULL);
+    }
 
     ret = task_table_for_each_in_qernel(task->qid, alloc_walk_cb, &ctx);
     if (ret == -ENOENT) {
@@ -413,9 +494,10 @@ static int alloc_run_per_row(struct quantum_task_struct *task)
             continue;
         }
 
-        pr_info("[alloc]   qid=%u frag=%u var=%u -> backend=%d fidelity=%d\n",
+        pr_info("[alloc]   qid=%u frag=%u var=%u (q=%u) -> backend=%d fidelity=%d\n",
                 p->prov.qid, p->prov.fragment_index,
-                p->prov.variant_index, p->backend_id, p->fidelity);
+                p->prov.variant_index, p->frag_qubits,
+                p->backend_id, p->fidelity);
 
         (void)quantum_batch_intake(p->backend_id, &p->prov);
     }
@@ -685,4 +767,53 @@ void quantum_alloc_set_backend_state(int backend_id, int state)
     spin_unlock_irqrestore(&g_alloc_lock, flags);
 
     pr_debug("quantum_alloc: backend=%d state→%d\n", backend_id, state);
+}
+
+/* ============================================================
+ * DEMO-PIVOT D-1: backend ETA accounting
+ *
+ * Used by quantum_batch.c (commit cluster -> add cluster_estimated_ns)
+ * and quantum_sched.c (cluster done -> sub cluster_actual_ns). Sits on
+ * g_devinfo_lock since it touches g_dev_info.backend_eta_ns[].
+ * ============================================================ */
+
+void quantum_alloc_eta_add(int backend_id, __u64 ns)
+{
+    unsigned long flags;
+
+    if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
+        return;
+
+    spin_lock_irqsave(&g_devinfo_lock, flags);
+    g_dev_info.backend_eta_ns[backend_id] += ns;
+    spin_unlock_irqrestore(&g_devinfo_lock, flags);
+}
+
+void quantum_alloc_eta_sub(int backend_id, __u64 ns)
+{
+    unsigned long flags;
+
+    if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
+        return;
+
+    spin_lock_irqsave(&g_devinfo_lock, flags);
+    if (g_dev_info.backend_eta_ns[backend_id] >= ns)
+        g_dev_info.backend_eta_ns[backend_id] -= ns;
+    else
+        g_dev_info.backend_eta_ns[backend_id] = 0;
+    spin_unlock_irqrestore(&g_devinfo_lock, flags);
+}
+
+__u64 quantum_alloc_eta_get(int backend_id)
+{
+    unsigned long flags;
+    __u64 v;
+
+    if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
+        return 0;
+
+    spin_lock_irqsave(&g_devinfo_lock, flags);
+    v = g_dev_info.backend_eta_ns[backend_id];
+    spin_unlock_irqrestore(&g_devinfo_lock, flags);
+    return v;
 }
