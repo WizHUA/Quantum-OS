@@ -3,6 +3,32 @@
 
 #include "quantum_types.h"
 
+/*
+ * quantum_batch_intake — SSOT §02.5 entry point.
+ *
+ * Real implementation lands in M5 (per-backend pool with K_BUNDLE / timeout
+ * driven binder). For PRE3 (B-1) we only need a working stub so alloc can
+ * hand off without coupling against the eventual pool data structures.
+ *
+ * Contract once M5 lands:
+ *   - O(1) push to per-backend intake_buf
+ *   - returns 0 on accept, -ENOSPC when intake_buf is full
+ *   - schedules pool_tick if K_BUNDLE reached
+ */
+int quantum_batch_intake(int backend_id,
+                         const struct quantum_provenance *prov)
+{
+    if (!prov)
+        return -EINVAL;
+    if (backend_id < 0 || backend_id >= QUANTUM_MAX_BACKENDS)
+        return -EINVAL;
+    pr_info("[batch] intake stub backend=%d qid=%u frag=%u var=%u shots=%u\n",
+            backend_id, prov->qid, prov->fragment_index,
+            prov->variant_index, prov->shots);
+    return 0;
+}
+EXPORT_SYMBOL_GPL(quantum_batch_intake);
+
 /* ============================================================
  * 内部：验证
  * ============================================================ */

@@ -6,6 +6,12 @@
 
 #include "quantum_types.h"
 
+/* Forward decl from quantum_batch.c — see SSOT §02.5. The real per-backend
+ * pool + binder lands in M5; this stub just records the handoff so M3/M4
+ * can wire alloc → batch without depending on the M5 rewrite. */
+int quantum_batch_intake(int backend_id,
+                         const struct quantum_provenance *prov);
+
 /* ============================================================
  * 全局状态
  * ============================================================ */
@@ -31,13 +37,11 @@ static DEFINE_SPINLOCK(g_devinfo_lock);
 /*
  * alloc_first_fit —— 第一个满足qubit数需求的空闲QPU
  *
- * 参数说明（统一签名，未使用的参数标注忽略）：
- *   need_qubits  需要的qubit数
- *   devinfo      硬件快照（本算法不使用，签名统一预留）
- *   task         任务元数据（本算法不使用，签名统一预留）
- *   out_backend  输出：选中的QPU编号
- *   out_start    输出：物理qubit起始编号（本算法使用：线性分配）
- *   out_phys     输出：逻辑→物理qubit完整映射（本算法简单填充）
+ * SSOT §02.4 (post pre-M3 review B-1): alloc only picks a backend; it does
+ * NOT touch phys_qubits[] — physical placement is owned by batch.binder
+ * inside the cluster. We keep the legacy signature for the strategy table
+ * but silently zero out_phys so callers that still inspect it see a
+ * neutral "unset" pattern.
  */
 static int alloc_first_fit(int need_qubits,
                             const struct quantum_dev_info *devinfo,
@@ -47,7 +51,12 @@ static int alloc_first_fit(int need_qubits,
                             int *out_phys)
 {
     unsigned long flags;
-    int i, j;
+    int i;
+
+    (void)devinfo; (void)task;
+
+    if (out_phys)
+        memset(out_phys, 0, QUANTUM_MAX_QUBITS * sizeof(int));
 
     spin_lock_irqsave(&g_alloc_lock, flags);
     for (i = 0; i < g_backend_pool.num_backends; i++) {
@@ -56,9 +65,7 @@ static int alloc_first_fit(int need_qubits,
             b->total_qubits >= need_qubits) {
             *out_backend = i;
             *out_start   = 0;
-            /* 线性映射：逻辑qubit j → 物理qubit j */
-            for (j = 0; j < need_qubits && j < QUANTUM_MAX_QUBITS; j++)
-                out_phys[j] = j;
+            b->num_qubits_available -= need_qubits; /* reserve count only */
             spin_unlock_irqrestore(&g_alloc_lock, flags);
             return 0;
         }
@@ -315,14 +322,28 @@ int quantum_alloc_run(struct quantum_task_struct *task)
     }
 
     task->assigned_backend_id = out_backend;
-    memcpy(task->phys_qubits, phys, sizeof(task->phys_qubits));
+    /*
+     * SSOT §02.4 (B-1 fix): alloc no longer fills task->phys_qubits[].
+     * batch.binder picks physical qubits per cluster; until M5 lands the
+     * full pool, we leave the array zeroed and hand the (qid, frag=0,
+     * variant=0) provenance off to the batch intake stub so the wiring
+     * is observable in dmesg.
+     */
+    memset(task->phys_qubits, 0, sizeof(task->phys_qubits));
     task->fidelity_score = estimate_fidelity(out_backend,
                                               task->num_qubits,
                                               task->gate_count,
                                               devinfo_snap);
 
-    pr_debug("quantum_alloc: qid=%d assigned backend=%d fidelity=%d\n",
-             task->qid, out_backend, task->fidelity_score);
+    {
+        struct quantum_provenance prov;
+        quantum_provenance_init(&prov, (__u32)task->qid, 0, 0);
+        prov.shots = task->shots;
+        (void)quantum_batch_intake(out_backend, &prov);
+    }
+
+    pr_info("[alloc] qid=%d frag=0 -> backend=%d fidelity=%d (phys deferred to batch)\n",
+            task->qid, out_backend, task->fidelity_score);
 
     kfree(devinfo_snap);
     return 0;
