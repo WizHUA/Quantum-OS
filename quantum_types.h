@@ -126,6 +126,43 @@
 #define QVSTATE_FAILED_VAR          6
 #define QVSTATE_CANCELLED_VAR       7
 
+/*
+ * ABI v3: state-to-string helpers — used by every module's pr_info()
+ * logging template (§02 modules-spec) and by the upcoming debugfs view.
+ * Inline so kernel callers stay header-only and so the strings live with
+ * the constants themselves (single source of truth).
+ */
+static inline const char *quantum_state_to_str(int s)
+{
+    switch (s) {
+    case QSTATE_RECEIVED:       return "RECEIVED";
+    case QSTATE_PREPARED:       return "PREPARED";
+    case QSTATE_ASSIGNED:       return "ASSIGNED";
+    case QSTATE_BUNDLED:        return "BUNDLED";
+    case QSTATE_RUNNING:        return "RUNNING";
+    case QSTATE_EM_COMBINING:   return "EM_COMBINING";
+    case QSTATE_RECONSTRUCTING: return "RECONSTRUCTING";
+    case QSTATE_DONE:           return "DONE";
+    case QSTATE_FAILED:         return "FAILED";
+    case QSTATE_CANCELLED:      return "CANCELLED";
+    default:                    return "UNKNOWN";
+    }
+}
+
+static inline const char *quantum_vstate_to_str(int s)
+{
+    switch (s) {
+    case QVSTATE_PREPARED:      return "PREPARED";
+    case QVSTATE_ASSIGNED:      return "ASSIGNED";
+    case QVSTATE_BUNDLED:       return "BUNDLED";
+    case QVSTATE_RUNNING:       return "RUNNING";
+    case QVSTATE_DONE_VAR:      return "DONE";
+    case QVSTATE_FAILED_VAR:    return "FAILED";
+    case QVSTATE_CANCELLED_VAR: return "CANCELLED";
+    default:                    return "UNKNOWN";
+    }
+}
+
 /* 任务类型 */
 #define QTASK_TYPE_NORMAL           0
 #define QTASK_TYPE_CALIB            1
